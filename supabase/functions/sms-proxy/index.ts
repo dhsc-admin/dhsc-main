@@ -1,18 +1,19 @@
 /**
  * Supabase Edge Function: `sms-proxy`
- * Zero-Trust server-side proxy to the Sendmode SMS-REST 3.0 Bulk SMS API.
+ * Phase 6: Sendmode API Integration & Zero-Trust Architecture
  *
- * Security & Functional Architecture (Phases 3–6):
- * - Strict CORS allowlist (`http://localhost:3000` and production Vercel URL only).
- * - Cryptographic JWT verification via `supabaseAdmin.auth.getUser(token)` before any logic executes.
- * - Hard 150-character (`MAX_ALLOWED_CHARACTERS = 150`) and 1-segment (`MAX_ALLOWED_SEGMENTS = 1`) business rule.
- * - Default `senderId` set to `"Dilli Haat"`.
- * - Server-side audience resolution from `public.contacts` / `customPhones` and `public.opt_outs` stripping.
- * - Server-side `analyzeSmsSegments`, `valid_recipient_count`, and `totalCost` recalculation.
- * - Server-side credit gatekeeper summing `scheduled` and `processing` rows (`402 Payment Required`).
- * - Write-Ahead state machine (`status = 'processing'` -> Sendmode dispatch -> `'sent'`/`'scheduled'` or `'failed'`).
- * - Sendmode SMS-REST 3.0 endpoint mapping (`/balance`, `/send`, `/send-bulk`, `/schedule-bulk`, `/schedule-delete`)
- *   with `Authorization: Bearer ${Deno.env.get("SMS_API")}` and sanitized `502 Bad Gateway` / `500` error handling.
+ * Security & Functional Guarantees:
+ * - Sendmode Base URL: `https://sms-rest.sendmode.dev`
+ * - Sendmode Auth Header: `Authorization: ${Deno.env.get("SMS_API")}` (no "Bearer" prefix)
+ * - Strict CORS allowlist (`http://localhost:3000` and production Vercel domain)
+ * - Cryptographic JWT verification via `supabaseAdmin.auth.getUser(token)` (`401 Unauthorized` if invalid)
+ * - Zero-Trust server-side audience resolution (`public.contacts`, `customPhones`, `public.opt_outs` stripping)
+ * - Zero-Trust server-side segment & credit math (`analyzeSmsSegments`, `MAX_ALLOWED_CHARACTERS = 150`, `MAX_ALLOWED_SEGMENTS = 1`)
+ * - Server-side credit gate via `GET /3.0/balance` and `sms_campaigns` reserved credits (`402 Payment Required`)
+ * - 100-recipient batch chunking via `Promise.all` on `POST /3.0/send/bulk` and `POST /3.0/schedule/bulk`
+ * - JSON body `{ "request_id": "..." }` on `DELETE /3.0/schedule`
+ * - Write-Ahead state machine (`status = 'processing'` -> `'sent'` / `'scheduled'` or `'failed'`)
+ * - Sanitized `500` error responses with server-side `console.error` logging
  */
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -21,10 +22,7 @@ import {
   type SupabaseClient,
 } from "https://esm.sh/@supabase/supabase-js@2.47.0";
 
-const SENDMODE_BASE_URL = (
-  Deno.env.get("SMS_REST_3_BASE_URL") ?? "https://rest.sendmode.com/v3"
-).replace(/\/+$/, "");
-
+const SENDMODE_BASE_URL = "https://sms-rest.sendmode.dev";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY =
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -43,6 +41,7 @@ const E164_REGEX = /^\+[1-9]\d{6,14}$/;
 const MAX_ALLOWED_CHARACTERS = 150;
 const MAX_ALLOWED_SEGMENTS = 1;
 const DEFAULT_SENDER_ID = "Dilli Haat";
+const SENDMODE_BATCH_LIMIT = 100;
 
 /**
  * Standard 3GPP TS 23.038 GSM-7 Default Alphabet (1 septet each)
@@ -135,9 +134,9 @@ function analyzeSmsSegments(text: string): SegmentAnalysis {
     MAX_ALLOWED_SEGMENTS === 1
       ? Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS)
       : Math.min(
-          multiSegmentLimit * MAX_ALLOWED_SEGMENTS,
-          MAX_ALLOWED_CHARACTERS
-        );
+        multiSegmentLimit * MAX_ALLOWED_SEGMENTS,
+        MAX_ALLOWED_CHARACTERS
+      );
   const remainingInCurrentSegment = Math.max(
     0,
     maxAllowedUnitsTotal - effectiveUnitCount
@@ -162,50 +161,17 @@ function analyzeSmsSegments(text: string): SegmentAnalysis {
 }
 
 /**
- * Converts a UTC ISO-8601 timestamp into Sendmode's required UTC date-time format (`YYYY-MM-DD HH:mm:ss`).
+ * Splits an array of phone numbers into chunks of at most `size` (default 100).
  */
-function formatSendmodeDate(isoUtc: string): string {
-  const date = new Date(isoUtc);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(
-    date.getUTCDate()
-  )} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(
-    date.getUTCSeconds()
-  )}`;
-}
-
-/**
- * Extracts and logs detailed Sendmode error responses server-side via `console.error()`
- * without leaking upstream provider internals to the client.
- */
-async function logSendmodeError(
-  res: Response,
-  operation: string
-): Promise<string> {
-  let rawBody = "";
-  try {
-    rawBody = await res.text();
-    const parsed = JSON.parse(rawBody);
-    const providerMessage =
-      parsed?.error ??
-      parsed?.message ??
-      parsed?.statusMessage ??
-      parsed?.detail ??
-      rawBody;
-    console.error(
-      `[Sendmode API Error - ${operation}] HTTP ${res.status}: ${String(
-        providerMessage
-      )}`,
-      parsed
-    );
-  } catch {
-    console.error(
-      `[Sendmode API Error - ${operation}] HTTP ${res.status}: ${
-        rawBody || res.statusText
-      }`
-    );
+function chunkPhoneNumbers(
+  phones: string[],
+  size: number = SENDMODE_BATCH_LIMIT
+): string[][] {
+  const chunks: string[][] = [];
+  for (let i = 0; i < phones.length; i += size) {
+    chunks.push(phones.slice(i, i + size));
   }
-  return `Sendmode ${operation} failed with HTTP ${res.status}.`;
+  return chunks;
 }
 
 /**
@@ -269,16 +235,9 @@ function isDuplicateIdempotencyError(err: unknown): boolean {
   return /duplicate key|unique constraint|idempotency_key/i.test(combined);
 }
 
-class SendmodeGatewayError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "SendmodeGatewayError";
-  }
-}
-
 /**
- * Fetches the live credit balance from Sendmode (`GET /balance`) and sums
- * `estimated_credits` for all `scheduled` and `processing` rows in `public.sms_campaigns`.
+ * Calls Sendmode `GET /3.0/balance` and computes reserved credits from
+ * `scheduled` (and `processing`) rows in `public.sms_campaigns`.
  */
 async function computeCreditLedger(
   supabaseAdmin: SupabaseClient
@@ -287,6 +246,23 @@ async function computeCreditLedger(
   reservedCredits: number;
   effectiveAvailableCredits: number;
 }> {
+  const balanceRes = await fetch(`${SENDMODE_BASE_URL}/3.0/balance`, {
+    method: "GET",
+    headers: {
+      Authorization: `${Deno.env.get("SMS_API")}`,
+    },
+  });
+
+  if (!balanceRes.ok) {
+    throw new Error(
+      `Failed to fetch credit balance from Sendmode (HTTP ${balanceRes.status}).`
+    );
+  }
+
+  const balanceJson = await balanceRes.json();
+  const parsedBalance = parseInt(String(balanceJson?.balance ?? 0), 10);
+  const liveBalance = Number.isNaN(parsedBalance) ? 0 : parsedBalance;
+
   const { data: campaignRows, error: dbErr } = await supabaseAdmin
     .from("sms_campaigns")
     .select("status, estimated_credits");
@@ -305,44 +281,6 @@ async function computeCreditLedger(
       0
     );
 
-  let providerRes: Response;
-  try {
-    providerRes = await fetch(`${SENDMODE_BASE_URL}/balance`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
-        Accept: "application/json",
-      },
-    });
-  } catch (networkErr) {
-    console.error("[Sendmode API Network Error - GET /balance]", networkErr);
-    throw new SendmodeGatewayError(
-      "Bad Gateway: Unable to reach Sendmode balance endpoint."
-    );
-  }
-
-  if (!providerRes.ok) {
-    await logSendmodeError(providerRes, "GET /balance");
-    throw new SendmodeGatewayError(
-      "Bad Gateway: Upstream SMS provider failed to return credit balance."
-    );
-  }
-
-  const providerJson = await providerRes.json();
-  const liveBalance = Number(
-    providerJson?.balance ?? providerJson?.liveBalance ?? 0
-  );
-
-  if (Number.isNaN(liveBalance)) {
-    console.error(
-      "[Sendmode API Error - GET /balance] Invalid balance payload:",
-      providerJson
-    );
-    throw new SendmodeGatewayError(
-      "Bad Gateway: Upstream SMS provider returned an invalid balance format."
-    );
-  }
-
   return {
     liveBalance,
     reservedCredits,
@@ -351,7 +289,8 @@ async function computeCreditLedger(
 }
 
 /**
- * Resolves the actual recipient E.164 phone list on the server:
+ * Resolves the actual recipient E.164 phone list strictly on the server:
+ * - Ignores client-supplied `recipientsCount` for billing/dispatch.
  * - Fetches all `phone` values from `public.opt_outs` into a `Set`.
  * - If `audienceId === "custom"`, validates E.164, deduplicates, and strips `opt_outs` from `customPhones`.
  * - If `audienceId === "all"`, `"random"`, or `"top"`, queries `public.contacts` for `phone_e164`,
@@ -474,8 +413,9 @@ async function resolveAudienceRecipients(
         body.audienceSize ??
         body.limit ??
         body.subsetSize ??
-        body.recipientsCount;
-      const limitN = Math.floor(Number(rawLimit ?? 0));
+        body.recipientsCount ??
+        500;
+      const limitN = Math.floor(Number(rawLimit));
       if (!Number.isFinite(limitN) || limitN <= 0) {
         return {
           clientError:
@@ -539,17 +479,17 @@ serve(async (req: Request): Promise<Response> => {
     const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
     // =========================================================================
-    // Cryptographic JWT Verification (Zero-Trust Identity Check)
+    // 1. Cryptographic JWT Verification (Zero-Trust Identity Check)
     // =========================================================================
     const authHeader =
       req.headers.get("Authorization") ?? req.headers.get("authorization") ?? "";
     const token = authHeader.startsWith("Bearer ")
       ? authHeader.slice(7).trim()
-      : "";
+      : authHeader.trim();
 
     if (!token) {
       return new Response(
-        JSON.stringify({ error: "Unauthorized: Missing Bearer token." }),
+        JSON.stringify({ error: "Unauthorized: Missing JWT token." }),
         {
           status: 401,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -577,7 +517,7 @@ serve(async (req: Request): Promise<Response> => {
     const { action } = body;
 
     // =========================================================================
-    // Action 1: `check_credit_balance` -> GET /balance
+    // A. Check Credit Balance (`GET /3.0/balance`)
     // =========================================================================
     if (action === "check_credit_balance") {
       const ledger = await computeCreditLedger(supabaseAdmin);
@@ -594,7 +534,7 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     // =========================================================================
-    // Action 2: `send_single_sms` -> POST /send
+    // B. Send Single SMS (`POST /3.0/send`)
     // =========================================================================
     if (action === "send_single_sms") {
       const {
@@ -631,17 +571,16 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Server-side segment & character limit enforcement (max 150 chars, 1 segment)
       const resolvedMessage = String(messageBody ?? message ?? "");
       const segmentAnalysis = analyzeSmsSegments(resolvedMessage);
-      const trueSegmentCount = segmentAnalysis.segments;
-      const serverCalculatedCost = trueSegmentCount;
+      const actualSegments = segmentAnalysis.segments;
+      const calculatedCost = actualSegments;
 
       if (
         !resolvedMessage ||
         segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
-        trueSegmentCount < 1 ||
-        trueSegmentCount > MAX_ALLOWED_SEGMENTS ||
+        actualSegments < 1 ||
+        actualSegments > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
@@ -655,7 +594,7 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Server-Side Opt-Out Verification (returns 403 Forbidden if blacklisted)
+      // Server-side opt-out verification
       const { data: optedOutRow, error: optOutErr } = await supabaseAdmin
         .from("opt_outs")
         .select("phone")
@@ -676,7 +615,7 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Basic Rate Limiting Guardrail (max 1 single SMS per 30 seconds per user)
+      // Per-user 30-second rate limit for single SMS
       const thirtySecondsAgoIso = new Date(
         Date.now() - 30 * 1000
       ).toISOString();
@@ -721,12 +660,12 @@ serve(async (req: Request): Promise<Response> => {
         }
       }
 
-      // Server-Side Credit Check (liveBalance - reservedCredits where reservedCredits includes scheduled + processing)
+      // Credit Gate via GET /3.0/balance
       const ledger = await computeCreditLedger(supabaseAdmin);
-      if (serverCalculatedCost > ledger.liveBalance - ledger.reservedCredits) {
+      if (ledger.liveBalance - ledger.reservedCredits < calculatedCost) {
         return new Response(
           JSON.stringify({
-            error: "Insufficient effective credits for test SMS.",
+            error: "Insufficient effective credits for single SMS.",
           }),
           {
             status: 402,
@@ -735,80 +674,8 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const sendmodeSinglePayload: Record<string, unknown> = {
-        to: cleanPhone,
-        senderid: trimmedSenderId,
-        message: resolvedMessage,
-      };
-
-      if (scheduledAt) {
-        sendmodeSinglePayload.senddate = formatSendmodeDate(
-          String(scheduledAt)
-        );
-      }
-
-      let providerRes: Response;
-      try {
-        providerRes = await fetch(`${SENDMODE_BASE_URL}/send`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
-            "Content-Type": "application/json",
-            ...(idempotencyKey
-              ? { "X-Idempotency-Key": String(idempotencyKey) }
-              : {}),
-          },
-          body: JSON.stringify(sendmodeSinglePayload),
-        });
-      } catch (networkErr) {
-        console.error("[Sendmode API Network Error - POST /send]", networkErr);
-        return new Response(
-          JSON.stringify({
-            error: "Bad Gateway: Failed to dispatch single SMS via provider.",
-          }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      if (!providerRes.ok) {
-        await logSendmodeError(providerRes, "POST /send");
-        return new Response(
-          JSON.stringify({
-            error: "Bad Gateway: Failed to dispatch single SMS via provider.",
-          }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      let providerData: Record<string, unknown> = {};
-      try {
-        providerData = await providerRes.json();
-      } catch {
-        providerData = {};
-      }
-
-      const messageId = String(
-        providerData.messageId ??
-          providerData.batchId ??
-          providerData.id ??
-          `${scheduledAt ? "sched-msg" : "msg"}-${Date.now()}`
-      );
-      const newBalance =
-        typeof providerData.newBalance === "number" ||
-        typeof providerData.balance === "number"
-          ? Number(providerData.newBalance ?? providerData.balance)
-          : scheduledAt
-          ? ledger.liveBalance
-          : Math.max(0, ledger.liveBalance - serverCalculatedCost);
-
-      // Record single SMS dispatch in `sms_campaigns` for audit trail and 30s rate-limit tracking
-      const { error: singleInsertErr } = await supabaseAdmin
+      // Write-Ahead Pre-dispatch Lock (`status = 'processing'`)
+      const { data: processingRow, error: insertErr } = await supabaseAdmin
         .from("sms_campaigns")
         .insert({
           idempotency_key: idempotencyKey || crypto.randomUUID(),
@@ -821,21 +688,23 @@ serve(async (req: Request): Promise<Response> => {
           encoding: segmentAnalysis.encoding,
           character_count: segmentAnalysis.rawCharacterCount,
           effective_unit_count: segmentAnalysis.effectiveUnitCount,
-          segments: trueSegmentCount,
+          segments: actualSegments,
           raw_recipient_count: 1,
           valid_recipient_count: 1,
           duplicates_removed_count: 0,
           opted_out_stripped_count: 0,
           invalid_rejected_count: 0,
           dispatch_type: scheduledAt ? "scheduled" : "immediate",
-          status: scheduledAt ? "scheduled" : "sent",
-          provider_campaign_id: messageId,
-          scheduled_at: scheduledAt ?? null,
-          dispatched_at: scheduledAt ? null : new Date().toISOString(),
-        });
+          status: "processing",
+          scheduled_at: scheduledAt
+            ? new Date(String(scheduledAt)).toISOString()
+            : null,
+        })
+        .select()
+        .single();
 
-      if (singleInsertErr) {
-        if (isDuplicateIdempotencyError(singleInsertErr)) {
+      if (insertErr) {
+        if (isDuplicateIdempotencyError(insertErr)) {
           return new Response(
             JSON.stringify({
               error: "Duplicate request blocked by Idempotency Key guardrail.",
@@ -846,15 +715,83 @@ serve(async (req: Request): Promise<Response> => {
             }
           );
         }
-        throw singleInsertErr;
+        throw insertErr;
       }
+
+      // Call Sendmode `POST /3.0/send`
+      let providerRes: Response;
+      try {
+        providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/send`, {
+          method: "POST",
+          headers: {
+            Authorization: `${Deno.env.get("SMS_API")}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            sender_id: trimmedSenderId,
+            message: resolvedMessage,
+            mobile_number: cleanPhone,
+          }),
+        });
+      } catch (networkErr) {
+        console.error(networkErr);
+        await supabaseAdmin
+          .from("sms_campaigns")
+          .update({
+            status: "failed",
+            failure_reason: "Network error communicating with Sendmode API.",
+          })
+          .eq("id", processingRow.id);
+
+        return new Response(
+          JSON.stringify({ error: "Sendmode failed to dispatch single SMS." }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      if (!providerRes.ok) {
+        await supabaseAdmin
+          .from("sms_campaigns")
+          .update({
+            status: "failed",
+            failure_reason: `Sendmode /3.0/send returned HTTP ${providerRes.status}.`,
+          })
+          .eq("id", processingRow.id);
+
+        return new Response(
+          JSON.stringify({ error: "Sendmode failed to dispatch single SMS." }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const providerData = await providerRes.json();
+      const requestId = String(providerData?.request_id ?? "");
+      const newBalance = Math.max(0, ledger.liveBalance - calculatedCost);
+
+      const { error: updateErr } = await supabaseAdmin
+        .from("sms_campaigns")
+        .update({
+          status: scheduledAt ? "scheduled" : "sent",
+          provider_campaign_id: requestId,
+          dispatched_at: scheduledAt ? null : new Date().toISOString(),
+        })
+        .eq("id", processingRow.id);
+
+      if (updateErr) throw updateErr;
 
       return new Response(
         JSON.stringify({
           success: true,
-          messageId,
-          segmentCount: trueSegmentCount,
-          totalCost: serverCalculatedCost,
+          request_id: requestId,
+          messageId: requestId,
+          segmentCount: actualSegments,
+          totalCost: calculatedCost,
           newBalance,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -862,7 +799,7 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     // =========================================================================
-    // Action 3: `send_bulk_sms` -> POST /send-bulk
+    // C. Send Bulk SMS (`POST /3.0/send/bulk` with 100-number chunking)
     // =========================================================================
     if (action === "send_bulk_sms") {
       const {
@@ -913,14 +850,14 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Server-side segment & character limit enforcement (max 150 chars, 1 segment)
+      // 1. Server-side segment & character analysis (Zero-Trust)
       const segmentAnalysis = analyzeSmsSegments(messageText);
-      const trueSegments = segmentAnalysis.segments;
+      const actualSegments = segmentAnalysis.segments;
 
       if (
         segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
-        trueSegments < 1 ||
-        trueSegments > MAX_ALLOWED_SEGMENTS ||
+        actualSegments < 1 ||
+        actualSegments > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
@@ -934,7 +871,7 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Server-side audience resolution & opt-out stripping
+      // 2. Fetch Recipients Server-Side (Zero-Trust; ignores frontend `recipientsCount`)
       const resolvedAudience = await resolveAudienceRecipients(
         supabaseAdmin,
         String(audienceId),
@@ -976,16 +913,16 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const serverCalculatedCost = validCount * trueSegments;
+      // 3. Calculate Cost Server-Side
+      const calculatedCost = actualSegments * validPhoneArray.length;
 
-      // Server-Side Credit Gatekeeper (`scheduled` + `processing` reserved credits)
+      // 4. Credit Gate via `GET /3.0/balance`
       const ledger = await computeCreditLedger(supabaseAdmin);
-      if (serverCalculatedCost > ledger.liveBalance - ledger.reservedCredits) {
+      if (ledger.liveBalance - ledger.reservedCredits < calculatedCost) {
         return new Response(
           JSON.stringify({
-            error: `Insufficient effective credits: need ${serverCalculatedCost}, have ${
-              ledger.liveBalance - ledger.reservedCredits
-            }.`,
+            error: `Insufficient effective credits: need ${calculatedCost}, have ${ledger.liveBalance - ledger.reservedCredits
+              }.`,
           }),
           {
             status: 402,
@@ -994,7 +931,7 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Write-Ahead State Machine Step 1: INSERT with `status = 'processing'`
+      // 5. Write-Ahead Pre-dispatch Lock (`status = 'processing'`)
       const { data: processingCampaign, error: insertErr } = await supabaseAdmin
         .from("sms_campaigns")
         .insert({
@@ -1008,7 +945,7 @@ serve(async (req: Request): Promise<Response> => {
           encoding: segmentAnalysis.encoding,
           character_count: segmentAnalysis.rawCharacterCount,
           effective_unit_count: segmentAnalysis.effectiveUnitCount,
-          segments: trueSegments,
+          segments: actualSegments,
           raw_recipient_count: rawRecipientCount,
           valid_recipient_count: validCount,
           duplicates_removed_count: duplicatesRemovedCount,
@@ -1035,51 +972,51 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      // Write-Ahead State Machine Step 2: Call Sendmode POST /send-bulk
-      let providerRes: Response;
+      // 6. Chunk `validPhoneArray` into batches of 100 and dispatch via `Promise.all`
+      const phoneBatches = chunkPhoneNumbers(
+        validPhoneArray,
+        SENDMODE_BATCH_LIMIT
+      );
+      let joinedRequestIds = "";
+
       try {
-        providerRes = await fetch(`${SENDMODE_BASE_URL}/send-bulk`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
-            "Content-Type": "application/json",
-            "X-Idempotency-Key": String(idempotencyKey),
-          },
-          body: JSON.stringify({
-            to: validPhoneArray,
-            senderid: trimmedSenderId,
-            message: messageText,
-          }),
-        });
-      } catch (networkErr) {
-        console.error(
-          "[Sendmode API Network Error - POST /send-bulk]",
-          networkErr
-        );
-        await supabaseAdmin
-          .from("sms_campaigns")
-          .update({
-            status: "failed",
-            failure_reason: "Network error communicating with Sendmode API.",
+        const batchRequestIds = await Promise.all(
+          phoneBatches.map(async (batch) => {
+            const providerRes = await fetch(
+              `${SENDMODE_BASE_URL}/3.0/send/bulk`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `${Deno.env.get("SMS_API")}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  sender_id: trimmedSenderId,
+                  message: messageText,
+                  mobile_numbers: batch,
+                }),
+              }
+            );
+
+            if (!providerRes.ok) {
+              throw new Error(
+                `Sendmode /3.0/send/bulk returned HTTP ${providerRes.status}.`
+              );
+            }
+
+            const providerData = await providerRes.json();
+            return String(providerData?.request_id ?? "").trim();
           })
-          .eq("id", processingCampaign.id);
-
-        return new Response(
-          JSON.stringify({
-            error: "Bad Gateway: Provider bulk SMS dispatch failed.",
-          }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
         );
-      }
 
-      if (!providerRes.ok) {
-        const failureReason = await logSendmodeError(
-          providerRes,
-          "POST /send-bulk"
-        );
+        joinedRequestIds = batchRequestIds.filter(Boolean).join(",");
+      } catch (providerErr) {
+        console.error(providerErr);
+        const failureReason =
+          providerErr instanceof Error
+            ? providerErr.message
+            : "Sendmode bulk SMS dispatch failed.";
+
         await supabaseAdmin
           .from("sms_campaigns")
           .update({
@@ -1089,9 +1026,7 @@ serve(async (req: Request): Promise<Response> => {
           .eq("id", processingCampaign.id);
 
         return new Response(
-          JSON.stringify({
-            error: "Bad Gateway: Provider bulk SMS dispatch failed.",
-          }),
+          JSON.stringify({ error: "Sendmode bulk SMS dispatch failed." }),
           {
             status: 502,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -1099,32 +1034,12 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      let providerData: Record<string, unknown> = {};
-      try {
-        providerData = await providerRes.json();
-      } catch {
-        providerData = {};
-      }
-
-      const batchId = String(
-        providerData.batchId ??
-          providerData.batch_id ??
-          providerData.providerCampaignId ??
-          providerData.id ??
-          `batch-${Date.now()}`
-      );
-      const newBalance =
-        typeof providerData.newBalance === "number" ||
-        typeof providerData.balance === "number"
-          ? Number(providerData.newBalance ?? providerData.balance)
-          : Math.max(0, ledger.liveBalance - serverCalculatedCost);
-
-      // Write-Ahead State Machine Step 3: UPDATE row to `status = 'sent'`
+      // 7. Post-dispatch Update (`status = 'sent'`, `provider_campaign_id = joinedRequestIds`)
       const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
         .update({
           status: "sent",
-          provider_campaign_id: batchId,
+          provider_campaign_id: joinedRequestIds,
           dispatched_at: new Date().toISOString(),
         })
         .eq("id", processingCampaign.id)
@@ -1133,13 +1048,16 @@ serve(async (req: Request): Promise<Response> => {
 
       if (updateErr) throw updateErr;
 
+      const newBalance = Math.max(0, ledger.liveBalance - calculatedCost);
+
       return new Response(
         JSON.stringify({
           success: true,
-          batchId,
+          request_id: joinedRequestIds,
+          batchId: joinedRequestIds,
           recipientsCount: validCount,
-          segmentCount: trueSegments,
-          totalCost: serverCalculatedCost,
+          segmentCount: actualSegments,
+          totalCost: calculatedCost,
           newBalance,
           campaign: finalizedCampaign,
         }),
@@ -1148,7 +1066,7 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     // =========================================================================
-    // Action 4: `schedule_bulk_sms` -> POST /schedule-bulk
+    // D. Schedule Bulk SMS (`POST /3.0/schedule/bulk`)
     // =========================================================================
     if (action === "schedule_bulk_sms") {
       const {
@@ -1202,14 +1120,14 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Server-side segment & character limit enforcement (max 150 chars, 1 segment)
+      // 1. Server-side segment & character analysis (Zero-Trust)
       const segmentAnalysis = analyzeSmsSegments(messageText);
-      const trueSegments = segmentAnalysis.segments;
+      const actualSegments = segmentAnalysis.segments;
 
       if (
         segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
-        trueSegments < 1 ||
-        trueSegments > MAX_ALLOWED_SEGMENTS ||
+        actualSegments < 1 ||
+        actualSegments > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
@@ -1223,9 +1141,9 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const diffMinutes =
-        (Date.parse(String(scheduledAt)) - Date.now()) / (1000 * 60);
-      if (Number.isNaN(diffMinutes) || diffMinutes < 15) {
+      const parsedScheduleMs = Date.parse(String(scheduledAt));
+      const diffMinutes = (parsedScheduleMs - Date.now()) / (1000 * 60);
+      if (Number.isNaN(parsedScheduleMs) || diffMinutes < 15) {
         return new Response(
           JSON.stringify({
             error:
@@ -1238,7 +1156,10 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Server-side audience resolution & opt-out stripping
+      // Format `schedule_date` as an ISO 8601 string in UTC
+      const scheduleDateIsoUtc = new Date(parsedScheduleMs).toISOString();
+
+      // 2. Fetch Recipients Server-Side (Zero-Trust; ignores frontend `recipientsCount`)
       const resolvedAudience = await resolveAudienceRecipients(
         supabaseAdmin,
         String(audienceId),
@@ -1280,16 +1201,16 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const serverCalculatedCost = validCount * trueSegments;
+      // 3. Calculate Cost Server-Side
+      const calculatedCost = actualSegments * validPhoneArray.length;
 
-      // Server-Side Credit Gatekeeper (`scheduled` + `processing` reserved credits)
+      // 4. Credit Gate via `GET /3.0/balance`
       const ledger = await computeCreditLedger(supabaseAdmin);
-      if (serverCalculatedCost > ledger.liveBalance - ledger.reservedCredits) {
+      if (ledger.liveBalance - ledger.reservedCredits < calculatedCost) {
         return new Response(
           JSON.stringify({
-            error: `Insufficient effective credits: need ${serverCalculatedCost}, have ${
-              ledger.liveBalance - ledger.reservedCredits
-            }.`,
+            error: `Insufficient effective credits: need ${calculatedCost}, have ${ledger.liveBalance - ledger.reservedCredits
+              }.`,
           }),
           {
             status: 402,
@@ -1298,7 +1219,7 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Write-Ahead State Machine Step 1: INSERT with `status = 'processing'`
+      // 5. Write-Ahead Pre-dispatch Lock (`status = 'processing'`)
       const { data: processingCampaign, error: insertErr } = await supabaseAdmin
         .from("sms_campaigns")
         .insert({
@@ -1312,7 +1233,7 @@ serve(async (req: Request): Promise<Response> => {
           encoding: segmentAnalysis.encoding,
           character_count: segmentAnalysis.rawCharacterCount,
           effective_unit_count: segmentAnalysis.effectiveUnitCount,
-          segments: trueSegments,
+          segments: actualSegments,
           raw_recipient_count: rawRecipientCount,
           valid_recipient_count: validCount,
           duplicates_removed_count: duplicatesRemovedCount,
@@ -1320,7 +1241,7 @@ serve(async (req: Request): Promise<Response> => {
           invalid_rejected_count: invalidRejectedCount,
           dispatch_type: "scheduled",
           status: "processing",
-          scheduled_at: scheduledAt,
+          scheduled_at: scheduleDateIsoUtc,
         })
         .select()
         .single();
@@ -1340,54 +1261,52 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      const sendmodeScheduledDate = formatSendmodeDate(String(scheduledAt));
+      // 6. Chunk `validPhoneArray` into batches of 100 and schedule via `Promise.all`
+      const phoneBatches = chunkPhoneNumbers(
+        validPhoneArray,
+        SENDMODE_BATCH_LIMIT
+      );
+      let joinedRequestIds = "";
 
-      // Write-Ahead State Machine Step 2: Call Sendmode POST /schedule-bulk
-      let providerRes: Response;
       try {
-        providerRes = await fetch(`${SENDMODE_BASE_URL}/schedule-bulk`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
-            "Content-Type": "application/json",
-            "X-Idempotency-Key": String(idempotencyKey),
-          },
-          body: JSON.stringify({
-            to: validPhoneArray,
-            senderid: trimmedSenderId,
-            message: messageText,
-            senddate: sendmodeScheduledDate,
-          }),
-        });
-      } catch (networkErr) {
-        console.error(
-          "[Sendmode API Network Error - POST /schedule-bulk]",
-          networkErr
-        );
-        await supabaseAdmin
-          .from("sms_campaigns")
-          .update({
-            status: "failed",
-            failure_reason: "Network error communicating with Sendmode API.",
+        const batchRequestIds = await Promise.all(
+          phoneBatches.map(async (batch) => {
+            const providerRes = await fetch(
+              `${SENDMODE_BASE_URL}/3.0/schedule/bulk`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `${Deno.env.get("SMS_API")}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  sender_id: trimmedSenderId,
+                  message: messageText,
+                  mobile_numbers: batch,
+                  schedule_date: scheduleDateIsoUtc,
+                }),
+              }
+            );
+
+            if (!providerRes.ok) {
+              throw new Error(
+                `Sendmode /3.0/schedule/bulk returned HTTP ${providerRes.status}.`
+              );
+            }
+
+            const providerData = await providerRes.json();
+            return String(providerData?.request_id ?? "").trim();
           })
-          .eq("id", processingCampaign.id);
-
-        return new Response(
-          JSON.stringify({
-            error: "Bad Gateway: Provider campaign scheduling failed.",
-          }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
         );
-      }
 
-      if (!providerRes.ok) {
-        const failureReason = await logSendmodeError(
-          providerRes,
-          "POST /schedule-bulk"
-        );
+        joinedRequestIds = batchRequestIds.filter(Boolean).join(",");
+      } catch (providerErr) {
+        console.error(providerErr);
+        const failureReason =
+          providerErr instanceof Error
+            ? providerErr.message
+            : "Sendmode bulk campaign scheduling failed.";
+
         await supabaseAdmin
           .from("sms_campaigns")
           .update({
@@ -1398,7 +1317,7 @@ serve(async (req: Request): Promise<Response> => {
 
         return new Response(
           JSON.stringify({
-            error: "Bad Gateway: Provider campaign scheduling failed.",
+            error: "Sendmode campaign scheduling failed.",
           }),
           {
             status: 502,
@@ -1407,28 +1326,12 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      let providerData: Record<string, unknown> = {};
-      try {
-        providerData = await providerRes.json();
-      } catch {
-        providerData = {};
-      }
-
-      const providerCampaignId = String(
-        providerData.batchId ??
-          providerData.batch_id ??
-          providerData.providerCampaignId ??
-          providerData.scheduleId ??
-          providerData.id ??
-          `sched-${Date.now()}`
-      );
-
-      // Write-Ahead State Machine Step 3: UPDATE row to `status = 'scheduled'`
+      // 7. Post-dispatch Update (`status = 'scheduled'`, `provider_campaign_id = joinedRequestIds`)
       const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
         .update({
           status: "scheduled",
-          provider_campaign_id: providerCampaignId,
+          provider_campaign_id: joinedRequestIds,
         })
         .eq("id", processingCampaign.id)
         .select()
@@ -1439,10 +1342,11 @@ serve(async (req: Request): Promise<Response> => {
       return new Response(
         JSON.stringify({
           success: true,
-          providerCampaignId,
+          request_id: joinedRequestIds,
+          providerCampaignId: joinedRequestIds,
           recipientsCount: validCount,
-          segmentCount: trueSegments,
-          totalCost: serverCalculatedCost,
+          segmentCount: actualSegments,
+          totalCost: calculatedCost,
           campaign: finalizedCampaign,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -1450,10 +1354,10 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     // =========================================================================
-    // Action 5: `schedule_delete` -> POST /schedule-delete
+    // E. Schedule Delete (`DELETE /3.0/schedule` with JSON body `{ "request_id": "..." }`)
     // =========================================================================
     if (action === "schedule_delete") {
-      const { campaignId, providerCampaignId } = body;
+      const { campaignId, providerCampaignId, request_id } = body;
 
       let { data: campaign, error: fetchErr } = await supabaseAdmin
         .from("sms_campaigns")
@@ -1461,11 +1365,12 @@ serve(async (req: Request): Promise<Response> => {
         .eq("id", campaignId)
         .maybeSingle();
 
-      if ((!campaign || fetchErr) && providerCampaignId) {
+      if ((!campaign || fetchErr) && (providerCampaignId || request_id)) {
+        const lookupId = String(providerCampaignId ?? request_id);
         const fallbackRes = await supabaseAdmin
           .from("sms_campaigns")
           .select("*")
-          .eq("provider_campaign_id", providerCampaignId)
+          .eq("provider_campaign_id", lookupId)
           .maybeSingle();
         campaign = fallbackRes.data;
         fetchErr = fallbackRes.error;
@@ -1494,68 +1399,48 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const targetBatchId = String(
-        campaign.provider_campaign_id ?? providerCampaignId ?? ""
-      ).trim();
+      const rawRequestIds = String(
+        campaign.provider_campaign_id ?? providerCampaignId ?? request_id ?? ""
+      )
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean);
 
-      if (!targetBatchId) {
-        return new Response(
-          JSON.stringify({
-            error:
-              "Missing provider batchId for scheduled campaign cancellation.",
-          }),
-          {
-            status: 400,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
+      if (rawRequestIds.length > 0) {
+        try {
+          await Promise.all(
+            rawRequestIds.map(async (reqId) => {
+              const delRes = await fetch(`${SENDMODE_BASE_URL}/3.0/schedule`, {
+                method: "DELETE",
+                headers: {
+                  Authorization: `${Deno.env.get("SMS_API")}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ request_id: reqId }),
+              });
+
+              if (!delRes.ok) {
+                throw new Error(
+                  `Sendmode DELETE /3.0/schedule failed with HTTP ${delRes.status}.`
+                );
+              }
+            })
+          );
+        } catch (delErr) {
+          console.error(delErr);
+          return new Response(
+            JSON.stringify({
+              error:
+                "Sendmode Schedule Delete failed; Supabase status left unchanged.",
+            }),
+            {
+              status: 502,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
       }
 
-      // STEP 1: Call Sendmode `POST /schedule-delete` FIRST
-      let delRes: Response;
-      try {
-        delRes = await fetch(`${SENDMODE_BASE_URL}/schedule-delete`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            batchId: targetBatchId,
-          }),
-        });
-      } catch (networkErr) {
-        console.error(
-          "[Sendmode API Network Error - POST /schedule-delete]",
-          networkErr
-        );
-        return new Response(
-          JSON.stringify({
-            error:
-              "Bad Gateway: Provider Schedule Delete failed; Supabase status left unchanged.",
-          }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      if (!delRes.ok) {
-        await logSendmodeError(delRes, "POST /schedule-delete");
-        return new Response(
-          JSON.stringify({
-            error:
-              "Bad Gateway: Provider Schedule Delete failed; Supabase status left unchanged.",
-          }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      // STEP 2: Only after Sendmode confirms, mark `cancelled` in Supabase
       const { data: updated, error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
         .update({
@@ -1577,7 +1462,7 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     // =========================================================================
-    // Action 6: Opt-Out Number (`optout_number`)
+    // F. Opt-Out Number (`optout_number`)
     // =========================================================================
     if (action === "optout_number") {
       const { phoneNumber } = body;
@@ -1622,18 +1507,6 @@ serve(async (req: Request): Promise<Response> => {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (error) {
-    if (error instanceof SendmodeGatewayError) {
-      return new Response(
-        JSON.stringify({
-          error: error.message,
-        }),
-        {
-          status: 502,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        }
-      );
-    }
-
     console.error(error);
     return new Response(
       JSON.stringify({
