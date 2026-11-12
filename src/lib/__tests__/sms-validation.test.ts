@@ -1,7 +1,12 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 
 vi.hoisted(() => {
-  process.env.NEXT_PUBLIC_SUPABASE_URL ||= "https://example.supabase.co";
+  if (
+    !process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    !process.env.NEXT_PUBLIC_SUPABASE_URL.startsWith("http")
+  ) {
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://example.supabase.co";
+  }
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||= "test-anon-key";
 });
 

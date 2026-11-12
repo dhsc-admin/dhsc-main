@@ -1,4 +1,4 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -9,6 +9,29 @@ if (!supabaseUrl || !supabaseAnonKey) {
   );
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+let clientInstance: SupabaseClient | null = null;
+let cachedFunctions: SupabaseClient["functions"] | null = null;
+
+function getSupabaseClient(): SupabaseClient {
+  if (!clientInstance) {
+    clientInstance = createClient(supabaseUrl!, supabaseAnonKey!);
+  }
+  return clientInstance;
+}
+
+export const supabase: SupabaseClient = new Proxy({} as SupabaseClient, {
+  get(_target, prop) {
+    const client = getSupabaseClient();
+    if (prop === "functions") {
+      if (!cachedFunctions) {
+        cachedFunctions = client.functions;
+      }
+      return cachedFunctions;
+    }
+    const value = Reflect.get(client, prop, client);
+    return typeof value === "function" ? value.bind(client) : value;
+  },
+});
+
 
 

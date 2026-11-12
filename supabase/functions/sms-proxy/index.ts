@@ -1,8 +1,8 @@
 /**
  * Supabase Edge Function: `sms-proxy`
- * Zero-Trust server-side proxy to the third-party `sms-rest 3.0` Bulk SMS API.
+ * Zero-Trust server-side proxy to the Sendmode SMS-REST 3.0 Bulk SMS API.
  *
- * Security Hardening (Phase 3, Phase 4 & Phase 5):
+ * Security & Functional Architecture (Phases 3–6):
  * - Strict CORS allowlist (`http://localhost:3000` and production Vercel URL only).
  * - Cryptographic JWT verification via `supabaseAdmin.auth.getUser(token)` before any logic executes.
  * - Hard 150-character (`MAX_ALLOWED_CHARACTERS = 150`) and 1-segment (`MAX_ALLOWED_SEGMENTS = 1`) business rule.
@@ -10,22 +10,24 @@
  * - Server-side audience resolution from `public.contacts` / `customPhones` and `public.opt_outs` stripping.
  * - Server-side `analyzeSmsSegments`, `valid_recipient_count`, and `totalCost` recalculation.
  * - Server-side credit gatekeeper summing `scheduled` and `processing` rows (`402 Payment Required`).
- * - Write-Ahead state machine (`status = 'processing'` -> provider dispatch -> `'sent'`/`'scheduled'` or `'failed'`).
- * - Sanitized `500` error responses with server-side `console.error` logging.
+ * - Write-Ahead state machine (`status = 'processing'` -> Sendmode dispatch -> `'sent'`/`'scheduled'` or `'failed'`).
+ * - Sendmode SMS-REST 3.0 endpoint mapping (`/balance`, `/send`, `/send-bulk`, `/schedule-bulk`, `/schedule-delete`)
+ *   with `Authorization: Bearer ${Deno.env.get("SMS_API")}` and sanitized `502 Bad Gateway` / `500` error handling.
  */
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.47.0";
+import {
+  createClient,
+  type SupabaseClient,
+} from "https://esm.sh/@supabase/supabase-js@2.47.0";
 
-const SMS_PROVIDER_BASE_URL =
-  Deno.env.get("SMS_REST_3_BASE_URL") ?? "https://api.sms-rest.example/v3";
-const SMS_PROVIDER_API_KEY = Deno.env.get("SMS_REST_3_API_KEY") ?? "";
+const SENDMODE_BASE_URL = (
+  Deno.env.get("SMS_REST_3_BASE_URL") ?? "https://rest.sendmode.com/v3"
+).replace(/\/+$/, "");
+
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY =
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const DEFAULT_STARTING_CREDITS = Number(
-  Deno.env.get("DEFAULT_SMS_CREDITS") ?? 15000
-);
 
 const PRODUCTION_VERCEL_URL =
   Deno.env.get("PRODUCTION_VERCEL_URL") ??
@@ -36,10 +38,6 @@ const ALLOWED_ORIGINS = new Set<string>([
   "http://localhost:3000",
   PRODUCTION_VERCEL_URL,
 ]);
-
-const isLiveProviderConfigured =
-  Boolean(SMS_PROVIDER_API_KEY) &&
-  !SMS_PROVIDER_BASE_URL.includes(".example");
 
 const E164_REGEX = /^\+[1-9]\d{6,14}$/;
 const MAX_ALLOWED_CHARACTERS = 150;
@@ -164,6 +162,53 @@ function analyzeSmsSegments(text: string): SegmentAnalysis {
 }
 
 /**
+ * Converts a UTC ISO-8601 timestamp into Sendmode's required UTC date-time format (`YYYY-MM-DD HH:mm:ss`).
+ */
+function formatSendmodeDate(isoUtc: string): string {
+  const date = new Date(isoUtc);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(
+    date.getUTCDate()
+  )} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(
+    date.getUTCSeconds()
+  )}`;
+}
+
+/**
+ * Extracts and logs detailed Sendmode error responses server-side via `console.error()`
+ * without leaking upstream provider internals to the client.
+ */
+async function logSendmodeError(
+  res: Response,
+  operation: string
+): Promise<string> {
+  let rawBody = "";
+  try {
+    rawBody = await res.text();
+    const parsed = JSON.parse(rawBody);
+    const providerMessage =
+      parsed?.error ??
+      parsed?.message ??
+      parsed?.statusMessage ??
+      parsed?.detail ??
+      rawBody;
+    console.error(
+      `[Sendmode API Error - ${operation}] HTTP ${res.status}: ${String(
+        providerMessage
+      )}`,
+      parsed
+    );
+  } catch {
+    console.error(
+      `[Sendmode API Error - ${operation}] HTTP ${res.status}: ${
+        rawBody || res.statusText
+      }`
+    );
+  }
+  return `Sendmode ${operation} failed with HTTP ${res.status}.`;
+}
+
+/**
  * Strict CORS Enforcement: Only allow `http://localhost:3000` and the production Vercel URL.
  */
 function getCorsConfig(req: Request): {
@@ -224,24 +269,31 @@ function isDuplicateIdempotencyError(err: unknown): boolean {
   return /duplicate key|unique constraint|idempotency_key/i.test(combined);
 }
 
+class SendmodeGatewayError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SendmodeGatewayError";
+  }
+}
+
 /**
- * Computes live provider balance and sums `estimated_credits` for all
- * `scheduled` and `processing` rows in `public.sms_campaigns`.
+ * Fetches the live credit balance from Sendmode (`GET /balance`) and sums
+ * `estimated_credits` for all `scheduled` and `processing` rows in `public.sms_campaigns`.
  */
 async function computeCreditLedger(
-  supabaseAdmin: ReturnType<typeof createClient>
+  supabaseAdmin: SupabaseClient
 ): Promise<{
   liveBalance: number;
   reservedCredits: number;
   effectiveAvailableCredits: number;
 }> {
   const { data: campaignRows, error: dbErr } = await supabaseAdmin
-    .from<CampaignCreditRow>("sms_campaigns")
+    .from("sms_campaigns")
     .select("status, estimated_credits");
 
   if (dbErr) throw dbErr;
 
-  const rows: CampaignCreditRow[] = campaignRows ?? [];
+  const rows: CampaignCreditRow[] = (campaignRows ?? []) as CampaignCreditRow[];
   const reservedCredits = rows
     .filter(
       (r: CampaignCreditRow) =>
@@ -252,29 +304,42 @@ async function computeCreditLedger(
         sum + Number(r.estimated_credits ?? 0),
       0
     );
-  const sentCredits = rows
-    .filter((r: CampaignCreditRow) => r.status === "sent")
-    .reduce(
-      (sum: number, r: CampaignCreditRow) =>
-        sum + Number(r.estimated_credits ?? 0),
-      0
-    );
 
-  let liveBalance = Math.max(0, DEFAULT_STARTING_CREDITS - sentCredits);
-
-  if (isLiveProviderConfigured) {
-    const providerRes = await fetch(
-      `${SMS_PROVIDER_BASE_URL}/credits/balance`,
-      {
-        headers: { Authorization: `Bearer ${SMS_PROVIDER_API_KEY}` },
-      }
+  let providerRes: Response;
+  try {
+    providerRes = await fetch(`${SENDMODE_BASE_URL}/balance`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
+        Accept: "application/json",
+      },
+    });
+  } catch (networkErr) {
+    console.error("[Sendmode API Network Error - GET /balance]", networkErr);
+    throw new SendmodeGatewayError(
+      "Bad Gateway: Unable to reach Sendmode balance endpoint."
     );
-    if (!providerRes.ok) {
-      throw new Error("Failed to fetch credit balance from SMS provider.");
-    }
-    const providerJson = await providerRes.json();
-    liveBalance = Number(
-      providerJson.balance ?? providerJson.liveBalance ?? liveBalance
+  }
+
+  if (!providerRes.ok) {
+    await logSendmodeError(providerRes, "GET /balance");
+    throw new SendmodeGatewayError(
+      "Bad Gateway: Upstream SMS provider failed to return credit balance."
+    );
+  }
+
+  const providerJson = await providerRes.json();
+  const liveBalance = Number(
+    providerJson?.balance ?? providerJson?.liveBalance ?? 0
+  );
+
+  if (Number.isNaN(liveBalance)) {
+    console.error(
+      "[Sendmode API Error - GET /balance] Invalid balance payload:",
+      providerJson
+    );
+    throw new SendmodeGatewayError(
+      "Bad Gateway: Upstream SMS provider returned an invalid balance format."
     );
   }
 
@@ -294,18 +359,18 @@ async function computeCreditLedger(
  *   or Fisher-Yates shuffle `LIMIT N` for `"random"`).
  */
 async function resolveAudienceRecipients(
-  supabaseAdmin: ReturnType<typeof createClient>,
+  supabaseAdmin: SupabaseClient,
   audienceId: string,
   body: Record<string, unknown>
 ): Promise<{ data?: ResolvedAudienceResult; clientError?: string }> {
   const { data: optOutRows, error: optOutErr } = await supabaseAdmin
-    .from<OptOutRow>("opt_outs")
+    .from("opt_outs")
     .select("phone");
 
   if (optOutErr) throw optOutErr;
 
   const optOutSet = new Set<string>(
-    (optOutRows ?? [])
+    ((optOutRows ?? []) as OptOutRow[])
       .map((r: OptOutRow) =>
         String(r.phone ?? "")
           .trim()
@@ -360,7 +425,7 @@ async function resolveAudienceRecipients(
     audienceId === "top"
   ) {
     const contactsQuery = supabaseAdmin
-      .from<ContactRow>("contacts")
+      .from("contacts")
       .select("phone_e164, visit_count");
 
     const { data: contactRows, error: contactsErr } =
@@ -370,7 +435,7 @@ async function resolveAudienceRecipients(
 
     if (contactsErr) throw contactsErr;
 
-    const rows: ContactRow[] = [...(contactRows ?? [])];
+    const rows: ContactRow[] = [...((contactRows ?? []) as ContactRow[])];
     if (audienceId === "top") {
       rows.sort(
         (a: ContactRow, b: ContactRow) =>
@@ -511,7 +576,9 @@ serve(async (req: Request): Promise<Response> => {
     const body = await req.json();
     const { action } = body;
 
-    // 1. Check Credit Balance + Compute Effective Available Credits
+    // =========================================================================
+    // Action 1: `check_credit_balance` -> GET /balance
+    // =========================================================================
     if (action === "check_credit_balance") {
       const ledger = await computeCreditLedger(supabaseAdmin);
 
@@ -526,7 +593,9 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    // 2. Send Single SMS / Schedule Single SMS (`send_single_sms`)
+    // =========================================================================
+    // Action 2: `send_single_sms` -> POST /send
+    // =========================================================================
     if (action === "send_single_sms") {
       const {
         idempotencyKey,
@@ -666,58 +735,77 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      let messageId = `${scheduledAt ? "sched-msg" : "msg"}-${Date.now()}`;
-      let newBalance = scheduledAt
-        ? ledger.liveBalance
-        : Math.max(0, ledger.liveBalance - serverCalculatedCost);
+      const sendmodeSinglePayload: Record<string, unknown> = {
+        to: cleanPhone,
+        senderid: trimmedSenderId,
+        message: resolvedMessage,
+      };
 
-      if (isLiveProviderConfigured) {
-        const endpoint = scheduledAt
-          ? `${SMS_PROVIDER_BASE_URL}/messages/schedule`
-          : `${SMS_PROVIDER_BASE_URL}/messages/send`;
+      if (scheduledAt) {
+        sendmodeSinglePayload.senddate = formatSendmodeDate(
+          String(scheduledAt)
+        );
+      }
 
-        const providerRes = await fetch(endpoint, {
+      let providerRes: Response;
+      try {
+        providerRes = await fetch(`${SENDMODE_BASE_URL}/send`, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
+            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
             "Content-Type": "application/json",
             ...(idempotencyKey
               ? { "X-Idempotency-Key": String(idempotencyKey) }
               : {}),
           },
-          body: JSON.stringify({
-            to: cleanPhone,
-            senderId: trimmedSenderId,
-            message: resolvedMessage,
-            segments: trueSegmentCount,
-            totalCost: serverCalculatedCost,
-            scheduledAt: scheduledAt ?? undefined,
-          }),
+          body: JSON.stringify(sendmodeSinglePayload),
         });
-
-        if (!providerRes.ok) {
-          return new Response(
-            JSON.stringify({
-              error: "Provider failed to dispatch single SMS.",
-            }),
-            {
-              status: 502,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        const providerData = await providerRes.json();
-        messageId = providerData.messageId ?? providerData.id ?? messageId;
-        if (
-          typeof providerData.newBalance === "number" ||
-          typeof providerData.balance === "number"
-        ) {
-          newBalance = Number(
-            providerData.newBalance ?? providerData.balance
-          );
-        }
+      } catch (networkErr) {
+        console.error("[Sendmode API Network Error - POST /send]", networkErr);
+        return new Response(
+          JSON.stringify({
+            error: "Bad Gateway: Failed to dispatch single SMS via provider.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
+
+      if (!providerRes.ok) {
+        await logSendmodeError(providerRes, "POST /send");
+        return new Response(
+          JSON.stringify({
+            error: "Bad Gateway: Failed to dispatch single SMS via provider.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      let providerData: Record<string, unknown> = {};
+      try {
+        providerData = await providerRes.json();
+      } catch {
+        providerData = {};
+      }
+
+      const messageId = String(
+        providerData.messageId ??
+          providerData.batchId ??
+          providerData.id ??
+          `${scheduledAt ? "sched-msg" : "msg"}-${Date.now()}`
+      );
+      const newBalance =
+        typeof providerData.newBalance === "number" ||
+        typeof providerData.balance === "number"
+          ? Number(providerData.newBalance ?? providerData.balance)
+          : scheduledAt
+          ? ledger.liveBalance
+          : Math.max(0, ledger.liveBalance - serverCalculatedCost);
 
       // Record single SMS dispatch in `sms_campaigns` for audit trail and 30s rate-limit tracking
       const { error: singleInsertErr } = await supabaseAdmin
@@ -773,7 +861,9 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    // 3. Send Bulk SMS Immediately (`send_bulk_sms`)
+    // =========================================================================
+    // Action 3: `send_bulk_sms` -> POST /send-bulk
+    // =========================================================================
     if (action === "send_bulk_sms") {
       const {
         idempotencyKey,
@@ -945,86 +1035,89 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      let batchId = `batch-${Date.now()}`;
-      let newBalance = Math.max(0, ledger.liveBalance - serverCalculatedCost);
+      // Write-Ahead State Machine Step 2: Call Sendmode POST /send-bulk
+      let providerRes: Response;
+      try {
+        providerRes = await fetch(`${SENDMODE_BASE_URL}/send-bulk`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": String(idempotencyKey),
+          },
+          body: JSON.stringify({
+            to: validPhoneArray,
+            senderid: trimmedSenderId,
+            message: messageText,
+          }),
+        });
+      } catch (networkErr) {
+        console.error(
+          "[Sendmode API Network Error - POST /send-bulk]",
+          networkErr
+        );
+        await supabaseAdmin
+          .from("sms_campaigns")
+          .update({
+            status: "failed",
+            failure_reason: "Network error communicating with Sendmode API.",
+          })
+          .eq("id", processingCampaign.id);
 
-      // Write-Ahead State Machine Step 2: Call external SMS provider API
-      if (isLiveProviderConfigured) {
-        let providerRes: Response;
-        try {
-          providerRes = await fetch(
-            `${SMS_PROVIDER_BASE_URL}/campaigns/send`,
-            {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
-                "Content-Type": "application/json",
-                "X-Idempotency-Key": String(idempotencyKey),
-              },
-              body: JSON.stringify({
-                idempotencyKey,
-                name: trimmedName,
-                senderId: trimmedSenderId,
-                recipients: validPhoneArray,
-                recipientsCount: validCount,
-                segmentCount: trueSegments,
-                totalCost: serverCalculatedCost,
-                message: messageText,
-              }),
-            }
-          );
-        } catch (networkErr) {
-          console.error(networkErr);
-          await supabaseAdmin
-            .from("sms_campaigns")
-            .update({
-              status: "failed",
-              failure_reason: "Network error communicating with SMS provider.",
-            })
-            .eq("id", processingCampaign.id);
+        return new Response(
+          JSON.stringify({
+            error: "Bad Gateway: Provider bulk SMS dispatch failed.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
 
-          return new Response(
-            JSON.stringify({ error: "Provider bulk SMS dispatch failed." }),
-            {
-              status: 502,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
+      if (!providerRes.ok) {
+        const failureReason = await logSendmodeError(
+          providerRes,
+          "POST /send-bulk"
+        );
+        await supabaseAdmin
+          .from("sms_campaigns")
+          .update({
+            status: "failed",
+            failure_reason: failureReason,
+          })
+          .eq("id", processingCampaign.id);
 
-        if (!providerRes.ok) {
-          await supabaseAdmin
-            .from("sms_campaigns")
-            .update({
-              status: "failed",
-              failure_reason: `Provider returned HTTP ${providerRes.status} during bulk SMS dispatch.`,
-            })
-            .eq("id", processingCampaign.id);
+        return new Response(
+          JSON.stringify({
+            error: "Bad Gateway: Provider bulk SMS dispatch failed.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
 
-          return new Response(
-            JSON.stringify({ error: "Provider bulk SMS dispatch failed." }),
-            {
-              status: 502,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
+      let providerData: Record<string, unknown> = {};
+      try {
+        providerData = await providerRes.json();
+      } catch {
+        providerData = {};
+      }
 
-        const providerData = await providerRes.json();
-        batchId =
-          providerData.batchId ??
+      const batchId = String(
+        providerData.batchId ??
+          providerData.batch_id ??
           providerData.providerCampaignId ??
           providerData.id ??
-          batchId;
-        if (
-          typeof providerData.newBalance === "number" ||
-          typeof providerData.balance === "number"
-        ) {
-          newBalance = Number(
-            providerData.newBalance ?? providerData.balance
-          );
-        }
-      }
+          `batch-${Date.now()}`
+      );
+      const newBalance =
+        typeof providerData.newBalance === "number" ||
+        typeof providerData.balance === "number"
+          ? Number(providerData.newBalance ?? providerData.balance)
+          : Math.max(0, ledger.liveBalance - serverCalculatedCost);
 
       // Write-Ahead State Machine Step 3: UPDATE row to `status = 'sent'`
       const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
@@ -1054,7 +1147,9 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    // 4. Schedule Bulk SMS (`schedule_bulk_sms`)
+    // =========================================================================
+    // Action 4: `schedule_bulk_sms` -> POST /schedule-bulk
+    // =========================================================================
     if (action === "schedule_bulk_sms") {
       const {
         idempotencyKey,
@@ -1245,77 +1340,88 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      let providerCampaignId = `sched-${Date.now()}`;
+      const sendmodeScheduledDate = formatSendmodeDate(String(scheduledAt));
 
-      // Write-Ahead State Machine Step 2: Call external SMS provider API
-      if (isLiveProviderConfigured) {
-        let providerRes: Response;
-        try {
-          providerRes = await fetch(
-            `${SMS_PROVIDER_BASE_URL}/campaigns/schedule`,
-            {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
-                "Content-Type": "application/json",
-                "X-Idempotency-Key": String(idempotencyKey),
-              },
-              body: JSON.stringify({
-                idempotencyKey,
-                name: trimmedName,
-                senderId: trimmedSenderId,
-                recipients: validPhoneArray,
-                recipientsCount: validCount,
-                segmentCount: trueSegments,
-                totalCost: serverCalculatedCost,
-                message: messageText,
-                scheduledAt,
-              }),
-            }
-          );
-        } catch (networkErr) {
-          console.error(networkErr);
-          await supabaseAdmin
-            .from("sms_campaigns")
-            .update({
-              status: "failed",
-              failure_reason: "Network error communicating with SMS provider.",
-            })
-            .eq("id", processingCampaign.id);
+      // Write-Ahead State Machine Step 2: Call Sendmode POST /schedule-bulk
+      let providerRes: Response;
+      try {
+        providerRes = await fetch(`${SENDMODE_BASE_URL}/schedule-bulk`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": String(idempotencyKey),
+          },
+          body: JSON.stringify({
+            to: validPhoneArray,
+            senderid: trimmedSenderId,
+            message: messageText,
+            senddate: sendmodeScheduledDate,
+          }),
+        });
+      } catch (networkErr) {
+        console.error(
+          "[Sendmode API Network Error - POST /schedule-bulk]",
+          networkErr
+        );
+        await supabaseAdmin
+          .from("sms_campaigns")
+          .update({
+            status: "failed",
+            failure_reason: "Network error communicating with Sendmode API.",
+          })
+          .eq("id", processingCampaign.id);
 
-          return new Response(
-            JSON.stringify({ error: "Provider campaign scheduling failed." }),
-            {
-              status: 502,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        if (!providerRes.ok) {
-          await supabaseAdmin
-            .from("sms_campaigns")
-            .update({
-              status: "failed",
-              failure_reason: `Provider returned HTTP ${providerRes.status} during campaign scheduling.`,
-            })
-            .eq("id", processingCampaign.id);
-
-          return new Response(
-            JSON.stringify({ error: "Provider campaign scheduling failed." }),
-            {
-              status: 502,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        const providerData = await providerRes.json();
-        providerCampaignId =
-          providerData.providerCampaignId ??
-          providerData.id ??
-          providerCampaignId;
+        return new Response(
+          JSON.stringify({
+            error: "Bad Gateway: Provider campaign scheduling failed.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
+
+      if (!providerRes.ok) {
+        const failureReason = await logSendmodeError(
+          providerRes,
+          "POST /schedule-bulk"
+        );
+        await supabaseAdmin
+          .from("sms_campaigns")
+          .update({
+            status: "failed",
+            failure_reason: failureReason,
+          })
+          .eq("id", processingCampaign.id);
+
+        return new Response(
+          JSON.stringify({
+            error: "Bad Gateway: Provider campaign scheduling failed.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      let providerData: Record<string, unknown> = {};
+      try {
+        providerData = await providerRes.json();
+      } catch {
+        providerData = {};
+      }
+
+      const providerCampaignId = String(
+        providerData.batchId ??
+          providerData.batch_id ??
+          providerData.providerCampaignId ??
+          providerData.scheduleId ??
+          providerData.id ??
+          `sched-${Date.now()}`
+      );
 
       // Write-Ahead State Machine Step 3: UPDATE row to `status = 'scheduled'`
       const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
@@ -1343,7 +1449,9 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    // 5. Two-Step Atomic Cancellation (`Schedule Delete` -> Supabase `cancelled`)
+    // =========================================================================
+    // Action 5: `schedule_delete` -> POST /schedule-delete
+    // =========================================================================
     if (action === "schedule_delete") {
       const { campaignId, providerCampaignId } = body;
 
@@ -1386,33 +1494,68 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // STEP 1: Call sms-rest 3.0 `Schedule Delete` FIRST
-      if (isLiveProviderConfigured && campaign.provider_campaign_id) {
-        const delRes = await fetch(
-          `${SMS_PROVIDER_BASE_URL}/campaigns/schedule/${encodeURIComponent(
-            String(campaign.provider_campaign_id)
-          )}`,
+      const targetBatchId = String(
+        campaign.provider_campaign_id ?? providerCampaignId ?? ""
+      ).trim();
+
+      if (!targetBatchId) {
+        return new Response(
+          JSON.stringify({
+            error:
+              "Missing provider batchId for scheduled campaign cancellation.",
+          }),
           {
-            method: "DELETE",
-            headers: { Authorization: `Bearer ${SMS_PROVIDER_API_KEY}` },
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
           }
         );
-
-        if (!delRes.ok) {
-          return new Response(
-            JSON.stringify({
-              error:
-                "Provider Schedule Delete failed; Supabase status left unchanged.",
-            }),
-            {
-              status: 502,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
       }
 
-      // STEP 2: Only after provider confirms, mark `cancelled` in Supabase
+      // STEP 1: Call Sendmode `POST /schedule-delete` FIRST
+      let delRes: Response;
+      try {
+        delRes = await fetch(`${SENDMODE_BASE_URL}/schedule-delete`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${Deno.env.get("SMS_API")}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            batchId: targetBatchId,
+          }),
+        });
+      } catch (networkErr) {
+        console.error(
+          "[Sendmode API Network Error - POST /schedule-delete]",
+          networkErr
+        );
+        return new Response(
+          JSON.stringify({
+            error:
+              "Bad Gateway: Provider Schedule Delete failed; Supabase status left unchanged.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      if (!delRes.ok) {
+        await logSendmodeError(delRes, "POST /schedule-delete");
+        return new Response(
+          JSON.stringify({
+            error:
+              "Bad Gateway: Provider Schedule Delete failed; Supabase status left unchanged.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // STEP 2: Only after Sendmode confirms, mark `cancelled` in Supabase
       const { data: updated, error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
         .update({
@@ -1433,7 +1576,9 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    // 6. Opt-Out Number (`optout_number`)
+    // =========================================================================
+    // Action 6: Opt-Out Number (`optout_number`)
+    // =========================================================================
     if (action === "optout_number") {
       const { phoneNumber } = body;
       const cleanPhone = String(phoneNumber ?? "").trim();
@@ -1448,29 +1593,6 @@ serve(async (req: Request): Promise<Response> => {
             headers: { ...corsHeaders, "Content-Type": "application/json" },
           }
         );
-      }
-
-      if (isLiveProviderConfigured) {
-        const providerRes = await fetch(`${SMS_PROVIDER_BASE_URL}/optouts`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ phone: cleanPhone }),
-        });
-
-        if (!providerRes.ok) {
-          return new Response(
-            JSON.stringify({
-              error: "Failed to sync opt-out number with SMS provider.",
-            }),
-            {
-              status: 502,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
       }
 
       const { error: upsertErr } = await supabaseAdmin
@@ -1500,6 +1622,18 @@ serve(async (req: Request): Promise<Response> => {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (error) {
+    if (error instanceof SendmodeGatewayError) {
+      return new Response(
+        JSON.stringify({
+          error: error.message,
+        }),
+        {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
     console.error(error);
     return new Response(
       JSON.stringify({
