@@ -198,8 +198,8 @@ export const ApiServices = {
     const rawBalance = data?.liveBalance ?? data?.balance;
     const liveBalance =
       rawBalance !== undefined &&
-      rawBalance !== null &&
-      !Number.isNaN(Number(rawBalance))
+        rawBalance !== null &&
+        !Number.isNaN(Number(rawBalance))
         ? Number(rawBalance)
         : 15000;
     const reservedCredits = Number(data?.reservedCredits ?? 0);
@@ -249,8 +249,8 @@ export const ApiServices = {
         typeof data?.newBalance === "number"
           ? data.newBalance
           : typeof data?.liveBalance === "number"
-          ? data.liveBalance
-          : undefined,
+            ? data.liveBalance
+            : undefined,
     };
   },
 
@@ -320,8 +320,8 @@ export const ApiServices = {
         typeof data?.newBalance === "number"
           ? data.newBalance
           : typeof data?.liveBalance === "number"
-          ? data.liveBalance
-          : undefined,
+            ? data.liveBalance
+            : undefined,
     };
   },
 
@@ -488,7 +488,7 @@ export default function BulkSMSManager({
 
   // Test SMS Modal State
   const [testModalOpen, setTestModalOpen] = useState(false);
-  const [testPhone, setTestPhone] = useState("+919810012345");
+  const [testPhone, setTestPhone] = useState("+44");
   const [testScheduled, setTestScheduled] = useState(false);
   const [testScheduleDate, setTestScheduleDate] = useState("");
   const [testIdempotencyKey, setTestIdempotencyKey] = useState("");
@@ -641,9 +641,9 @@ export default function BulkSMSManager({
                 message: String(row.message ?? ""),
                 scheduledAt: String(
                   row.scheduled_at ??
-                    row.dispatched_at ??
-                    row.created_at ??
-                    new Date().toISOString()
+                  row.dispatched_at ??
+                  row.created_at ??
+                  new Date().toISOString()
                 ),
                 providerCampaignId: String(row.provider_campaign_id ?? ""),
               };
@@ -820,8 +820,8 @@ export default function BulkSMSManager({
         audienceType === "all"
           ? "All Contacts"
           : audienceType === "random"
-          ? `Random Contacts Subset (${recipientCount})`
-          : `Top Frequent Visitors (${recipientCount})`;
+            ? `Random Contacts Subset (${recipientCount})`
+            : `Top Frequent Visitors (${recipientCount})`;
 
       let providerRef = "";
       let campaignId = generateUUID();
@@ -904,8 +904,7 @@ export default function BulkSMSManager({
 
       setCampaigns((prev) => [newCampaign, ...prev]);
       showToast(
-        `Campaign "${newCampaign.name}" ${
-          isScheduled ? "scheduled" : "sent"
+        `Campaign "${newCampaign.name}" ${isScheduled ? "scheduled" : "sent"
         } successfully! (${estimatedCost.toLocaleString()} credits)`
       );
 
@@ -937,7 +936,7 @@ export default function BulkSMSManager({
     if (!cancelCheck.allowed) {
       showToast(
         cancelCheck.reason ||
-          `Safety Lock: Cannot cancel within ${MIN_CANCEL_BUFFER_MINUTES} minutes of dispatch.`,
+        `Safety Lock: Cannot cancel within ${MIN_CANCEL_BUFFER_MINUTES} minutes of dispatch.`,
         "error"
       );
       setConfirmCancelCampaign(null);
@@ -977,7 +976,7 @@ export default function BulkSMSManager({
     const cleanPhone = testPhone.trim().replace(/[\s()-]/g, "");
     if (!isValidE164(cleanPhone)) {
       showToast(
-        "Invalid E.164 phone number format. Must start with + and country code (e.g. +919810012345).",
+        "Invalid E.164 phone number format. Must start with + and country code (e.g. +44 7...).",
         "error"
       );
       return;
@@ -1013,7 +1012,7 @@ export default function BulkSMSManager({
       if (!check.valid) {
         showToast(
           check.error ||
-            `Scheduled single SMS must be at least ${MIN_SCHEDULE_BUFFER_MINUTES} minutes in the future.`,
+          `Scheduled single SMS must be at least ${MIN_SCHEDULE_BUFFER_MINUTES} minutes in the future.`,
           "error"
         );
         return;
@@ -1035,8 +1034,7 @@ export default function BulkSMSManager({
         setLiveBalance((prev) => Math.max(0, prev - msgDetails.segmentCount));
       }
       showToast(
-        `${testScheduled ? "Scheduled test SMS" : "Test SMS sent"} to ${cleanPhone} (${
-          msgDetails.segmentCount
+        `${testScheduled ? "Scheduled test SMS" : "Test SMS sent"} to ${cleanPhone} (${msgDetails.segmentCount
         } credit${msgDetails.segmentCount > 1 ? "s" : ""})`
       );
       setTestModalOpen(false);
@@ -1054,7 +1052,7 @@ export default function BulkSMSManager({
     e.preventDefault();
     const clean = newOptOutPhone.trim().replace(/[\s()-]/g, "");
     if (!isValidE164(clean)) {
-      showToast("Enter a valid E.164 number (e.g. +919810000109)", "error");
+      showToast("Enter a valid E.164 number (e.g. +447xxxxxxxxx)", "error");
       return;
     }
     if (optOuts.includes(clean)) {
@@ -1329,11 +1327,10 @@ export default function BulkSMSManager({
             </div>
             <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
               <div
-                className={`p-3 rounded-full ${
-                  !isLoadingData && effectiveCredits < 0
-                    ? "bg-red-50 text-red-600"
-                    : "bg-green-50 text-green-600"
-                }`}
+                className={`p-3 rounded-full ${!isLoadingData && effectiveCredits < 0
+                  ? "bg-red-50 text-red-600"
+                  : "bg-green-50 text-green-600"
+                  }`}
               >
                 {!isLoadingData && effectiveCredits < 0 ? (
                   <Icons.AlertTriangle className="w-6 h-6" />
@@ -1346,11 +1343,10 @@ export default function BulkSMSManager({
                   Effective Available
                 </p>
                 <p
-                  className={`text-2xl font-bold ${
-                    !isLoadingData && effectiveCredits < 0
-                      ? "text-red-600"
-                      : "text-slate-900"
-                  }`}
+                  className={`text-2xl font-bold ${!isLoadingData && effectiveCredits < 0
+                    ? "text-red-600"
+                    : "text-slate-900"
+                    }`}
                 >
                   {isLoadingData ? "—" : effectiveCredits.toLocaleString()}
                 </p>
@@ -1483,11 +1479,10 @@ export default function BulkSMSManager({
                   </span>
                 </div>
                 <textarea
-                  className={`w-full px-3 py-3 sm:py-2 border rounded-lg focus:ring-2 outline-none transition-all resize-none h-32 text-base sm:text-sm ${
-                    msgDetails.isOverLimit
-                      ? "border-red-400 focus:ring-red-500 focus:border-red-500 bg-red-50/20"
-                      : "border-slate-300 focus:ring-blue-500 focus:border-blue-500"
-                  }`}
+                  className={`w-full px-3 py-3 sm:py-2 border rounded-lg focus:ring-2 outline-none transition-all resize-none h-32 text-base sm:text-sm ${msgDetails.isOverLimit
+                    ? "border-red-400 focus:ring-red-500 focus:border-red-500 bg-red-50/20"
+                    : "border-slate-300 focus:ring-blue-500 focus:border-blue-500"
+                    }`}
                   placeholder="Type your message here..."
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
@@ -1505,11 +1500,10 @@ export default function BulkSMSManager({
                   <div className="flex justify-between">
                     <span className="text-slate-500">Encoding:</span>
                     <span
-                      className={`font-medium ${
-                        msgDetails.encoding === "UCS-2 (Unicode)"
-                          ? "text-purple-600"
-                          : "text-slate-700"
-                      }`}
+                      className={`font-medium ${msgDetails.encoding === "UCS-2 (Unicode)"
+                        ? "text-purple-600"
+                        : "text-slate-700"
+                        }`}
                     >
                       {msgDetails.encoding}
                     </span>
@@ -1526,9 +1520,8 @@ export default function BulkSMSManager({
                   <div className="flex justify-between">
                     <span className="text-slate-500">Segments/Msg:</span>
                     <span
-                      className={`font-medium ${
-                        msgDetails.isOverLimit ? "text-red-600 font-bold" : ""
-                      }`}
+                      className={`font-medium ${msgDetails.isOverLimit ? "text-red-600 font-bold" : ""
+                        }`}
                     >
                       {msgDetails.segmentCount} / {MAX_ALLOWED_SEGMENTS}
                     </span>
@@ -1544,13 +1537,12 @@ export default function BulkSMSManager({
                       Total Est. Cost:
                     </span>
                     <span
-                      className={`font-bold ${
-                        !isLoadingData &&
+                      className={`font-bold ${!isLoadingData &&
                         !creditGate.canAffordCampaign &&
                         estimatedCost > 0
-                          ? "text-red-600"
-                          : "text-blue-600"
-                      }`}
+                        ? "text-red-600"
+                        : "text-blue-600"
+                        }`}
                     >
                       {estimatedCost.toLocaleString()} credits
                     </span>
@@ -1609,11 +1601,10 @@ export default function BulkSMSManager({
                   <div className="space-y-1.5">
                     <input
                       type="datetime-local"
-                      className={`w-full px-3 py-3 sm:py-2 mt-1 border rounded-lg focus:ring-2 outline-none transition-all text-base sm:text-sm ${
-                        !scheduleValidation.valid
-                          ? "border-red-400 focus:ring-red-500"
-                          : "border-slate-300 focus:ring-blue-500 focus:border-blue-500"
-                      }`}
+                      className={`w-full px-3 py-3 sm:py-2 mt-1 border rounded-lg focus:ring-2 outline-none transition-all text-base sm:text-sm ${!scheduleValidation.valid
+                        ? "border-red-400 focus:ring-red-500"
+                        : "border-slate-300 focus:ring-blue-500 focus:border-blue-500"
+                        }`}
                       value={scheduleDate}
                       onChange={(e) => setScheduleDate(e.target.value)}
                     />
@@ -1645,11 +1636,10 @@ export default function BulkSMSManager({
               </button>
               <button
                 type="button"
-                className={`px-4 py-3 sm:py-2 rounded-lg text-base sm:text-sm font-medium text-white transition-colors flex items-center gap-2 w-full sm:flex-1 justify-center ${
-                  canSubmit
-                    ? "bg-blue-600 hover:bg-blue-700"
-                    : "bg-slate-300 cursor-not-allowed"
-                }`}
+                className={`px-4 py-3 sm:py-2 rounded-lg text-base sm:text-sm font-medium text-white transition-colors flex items-center gap-2 w-full sm:flex-1 justify-center ${canSubmit
+                  ? "bg-blue-600 hover:bg-blue-700"
+                  : "bg-slate-300 cursor-not-allowed"
+                  }`}
                 onClick={handleQueueCampaign}
                 disabled={!canSubmit || isSubmitting}
               >
@@ -1673,11 +1663,10 @@ export default function BulkSMSManager({
             <div className="px-4 sm:px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex gap-6 overflow-x-auto">
               <button
                 type="button"
-                className={`text-sm font-semibold pb-4 -mb-4 border-b-2 transition-colors whitespace-nowrap flex items-center gap-2 ${
-                  activeTab === "queued"
-                    ? "text-blue-600 border-blue-600"
-                    : "text-slate-500 border-transparent hover:text-slate-700"
-                }`}
+                className={`text-sm font-semibold pb-4 -mb-4 border-b-2 transition-colors whitespace-nowrap flex items-center gap-2 ${activeTab === "queued"
+                  ? "text-blue-600 border-blue-600"
+                  : "text-slate-500 border-transparent hover:text-slate-700"
+                  }`}
                 onClick={() => setActiveTab("queued")}
               >
                 <span>Queued (Future)</span>
@@ -1687,11 +1676,10 @@ export default function BulkSMSManager({
               </button>
               <button
                 type="button"
-                className={`text-sm font-semibold pb-4 -mb-4 border-b-2 transition-colors flex items-center gap-2 ${
-                  activeTab === "history"
-                    ? "text-blue-600 border-blue-600"
-                    : "text-slate-500 border-transparent hover:text-slate-700"
-                }`}
+                className={`text-sm font-semibold pb-4 -mb-4 border-b-2 transition-colors flex items-center gap-2 ${activeTab === "history"
+                  ? "text-blue-600 border-blue-600"
+                  : "text-slate-500 border-transparent hover:text-slate-700"
+                  }`}
                 onClick={() => setActiveTab("history")}
               >
                 <span>History (Past)</span>
@@ -1742,11 +1730,10 @@ export default function BulkSMSManager({
 
                               <div className="flex items-center gap-2">
                                 <span
-                                  className={`text-xs px-2 py-0.5 rounded-full font-medium border ${
-                                    isCoveredByBalance
-                                      ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-                                      : "bg-red-50 text-red-700 border-red-200"
-                                  }`}
+                                  className={`text-xs px-2 py-0.5 rounded-full font-medium border ${isCoveredByBalance
+                                    ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                    : "bg-red-50 text-red-700 border-red-200"
+                                    }`}
                                 >
                                   {isCoveredByBalance
                                     ? "Balance Covered"
@@ -1795,13 +1782,13 @@ export default function BulkSMSManager({
                               <span className="text-xs text-slate-400">
                                 {!cancelGuard.allowed
                                   ? `Dispatching in ${Math.max(
-                                      0,
-                                      cancelGuard.minutesRemaining
-                                    ).toFixed(1)}m (${MIN_CANCEL_BUFFER_MINUTES}m lock active)`
+                                    0,
+                                    cancelGuard.minutesRemaining
+                                  ).toFixed(1)}m (${MIN_CANCEL_BUFFER_MINUTES}m lock active)`
                                   : `Dispatches in ${Math.max(
-                                      0,
-                                      Math.round(cancelGuard.minutesRemaining)
-                                    )} mins`}
+                                    0,
+                                    Math.round(cancelGuard.minutesRemaining)
+                                  )} mins`}
                               </span>
 
                               {!cancelGuard.allowed ? (
@@ -1861,11 +1848,10 @@ export default function BulkSMSManager({
                         </div>
 
                         <span
-                          className={`text-xs px-2.5 py-1 rounded-full font-medium ${
-                            campaign.status === "sent"
-                              ? "bg-green-100 text-green-700"
-                              : "bg-slate-100 text-slate-600"
-                          }`}
+                          className={`text-xs px-2.5 py-1 rounded-full font-medium ${campaign.status === "sent"
+                            ? "bg-green-100 text-green-700"
+                            : "bg-slate-100 text-slate-600"
+                            }`}
                         >
                           {campaign.status.charAt(0).toUpperCase() +
                             campaign.status.slice(1)}
@@ -2038,11 +2024,11 @@ export default function BulkSMSManager({
                   value={testPhone}
                   onChange={(e) => setTestPhone(e.target.value)}
                   className="w-full px-3 py-3 sm:py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-base sm:text-sm font-mono"
-                  placeholder="+919810012345"
+                  placeholder="+447777777777"
                 />
                 {!E164_REGEX.test(testPhone.trim()) && testPhone.trim().length > 0 && (
                   <p className="text-xs text-red-600 mt-1">
-                    Must start with + followed by country code and digits (e.g. +919810012345).
+                    Must start with + followed by country code and digits (e.g. +447777777777).
                   </p>
                 )}
               </div>
@@ -2131,7 +2117,7 @@ export default function BulkSMSManager({
                   type="tel"
                   value={newOptOutPhone}
                   onChange={(e) => setNewOptOutPhone(e.target.value)}
-                  placeholder="+919810000109"
+                  placeholder="+447777777777"
                   className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 outline-none"
                 />
                 <button

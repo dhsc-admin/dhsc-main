@@ -31,7 +31,7 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
   });
 
   it("1. Enforces strict E.164 validation, deduplication, and opt-out stripping", () => {
-    expect(isValidE164("+919810012345")).toBe(true);
+    expect(isValidE164("+447777777777")).toBe(true);
     expect(isValidE164("+14155552671")).toBe(true);
     expect(isValidE164("98100-12345")).toBe(false);
     expect(isValidE164("+0123456789")).toBe(false);
