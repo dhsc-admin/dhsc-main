@@ -6,16 +6,13 @@
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- 0. Customer Contacts Table (`contacts` — uploaded from customer CSV)
+-- 0. Customer Contacts Table (`contacts` — normalized minimal schema without unnecessary PII)
 CREATE TABLE IF NOT EXISTS public.contacts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    "Customer Name" TEXT,
-    "Telephone" TEXT,
-    "E-Mail" TEXT,
-    "Address" TEXT,
-    "City" TEXT,
-    "Postcode" TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT (now() AT TIME ZONE 'utc')
+    phone_e164 TEXT NOT NULL UNIQUE CHECK (phone_e164 ~ '^\+[1-9][0-9]{6,14}$'),
+    customer_name TEXT,
+    visit_count INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- 1. Opt-Out / Blacklist Registry (`opt_outs`)
@@ -25,7 +22,7 @@ CREATE TABLE IF NOT EXISTS public.opt_outs (
     reason TEXT NOT NULL DEFAULT 'User opted out',
     source TEXT NOT NULL DEFAULT 'webhook_stop' CHECK (source IN ('webhook_stop', 'manual_admin', 'provider_sync')),
     provider_synced BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT (now() AT TIME ZONE 'utc'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT opt_outs_phone_e164_chk CHECK (phone ~ '^\+[1-9][0-9]{6,14}$')
 );
 
@@ -35,14 +32,14 @@ CREATE TABLE IF NOT EXISTS public.sms_campaigns (
     idempotency_key UUID NOT NULL UNIQUE,
     user_id UUID NOT NULL DEFAULT auth.uid(),
     name TEXT NOT NULL CHECK (char_length(trim(name)) BETWEEN 3 AND 80),
-    sender_id TEXT NOT NULL CHECK (char_length(trim(sender_id)) BETWEEN 3 AND 15),
+    sender_id TEXT NOT NULL DEFAULT 'Dilli Haat' CHECK (char_length(trim(sender_id)) BETWEEN 3 AND 15),
     audience_id TEXT NOT NULL,
     audience_name TEXT NOT NULL,
-    message TEXT NOT NULL CHECK (char_length(message) > 0),
+    message TEXT NOT NULL CHECK (char_length(message) BETWEEN 1 AND 150),
     encoding TEXT NOT NULL CHECK (encoding IN ('GSM-7', 'UCS-2')),
-    character_count INTEGER NOT NULL CHECK (character_count > 0),
-    effective_unit_count INTEGER NOT NULL CHECK (effective_unit_count > 0),
-    segments INTEGER NOT NULL CHECK (segments BETWEEN 1 AND 5),
+    character_count INTEGER NOT NULL CHECK (character_count BETWEEN 1 AND 150),
+    effective_unit_count INTEGER NOT NULL CHECK (effective_unit_count BETWEEN 1 AND 150),
+    segments INTEGER NOT NULL CHECK (segments = 1),
     raw_recipient_count INTEGER NOT NULL CHECK (raw_recipient_count >= valid_recipient_count),
     valid_recipient_count INTEGER NOT NULL CHECK (valid_recipient_count > 0),
     duplicates_removed_count INTEGER NOT NULL DEFAULT 0 CHECK (duplicates_removed_count >= 0),
@@ -50,13 +47,13 @@ CREATE TABLE IF NOT EXISTS public.sms_campaigns (
     invalid_rejected_count INTEGER NOT NULL DEFAULT 0 CHECK (invalid_rejected_count >= 0),
     estimated_credits INTEGER GENERATED ALWAYS AS (valid_recipient_count * segments) STORED,
     dispatch_type TEXT NOT NULL CHECK (dispatch_type IN ('immediate', 'scheduled')),
-    status TEXT NOT NULL CHECK (status IN ('scheduled', 'sent', 'cancelled', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('processing', 'scheduled', 'sent', 'cancelled', 'failed')),
     provider_campaign_id TEXT,
     scheduled_at TIMESTAMPTZ,
     dispatched_at TIMESTAMPTZ,
     cancelled_at TIMESTAMPTZ,
     failure_reason TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT (now() AT TIME ZONE 'utc'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT scheduled_requires_timestamp_chk CHECK (
         (dispatch_type = 'scheduled' AND scheduled_at IS NOT NULL) OR
         (dispatch_type = 'immediate')
@@ -65,7 +62,7 @@ CREATE TABLE IF NOT EXISTS public.sms_campaigns (
 
 CREATE INDEX IF NOT EXISTS idx_sms_campaigns_status_scheduled
     ON public.sms_campaigns (status, scheduled_at)
-    WHERE status = 'scheduled';
+    WHERE status IN ('scheduled', 'processing');
 
 -- 3. Database Trigger: Enforce 15-Minute Future Buffer on INSERT & 5-Minute Cancel Lock on UPDATE
 CREATE OR REPLACE FUNCTION public.enforce_sms_campaign_time_guards()
@@ -98,7 +95,7 @@ CREATE TRIGGER trg_enforce_sms_campaign_time_guards
     FOR EACH ROW
     EXECUTE FUNCTION public.enforce_sms_campaign_time_guards();
 
--- 4. Row Level Security (RLS) — Zero-Trust Lockdown (Authenticated Only, Append/Read Only)
+-- 4. Row Level Security (RLS) — Strict Read-Only Client Access (Mutations via service_role in sms-proxy only)
 ALTER TABLE public.contacts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.opt_outs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sms_campaigns ENABLE ROW LEVEL SECURITY;
@@ -107,66 +104,43 @@ ALTER TABLE public.contacts FORCE ROW LEVEL SECURITY;
 ALTER TABLE public.opt_outs FORCE ROW LEVEL SECURITY;
 ALTER TABLE public.sms_campaigns FORCE ROW LEVEL SECURITY;
 
--- Explicitly revoke all anonymous access and disallow DELETE for all users (Append/Read/Update only)
+-- Explicitly revoke all anonymous access and all client-side mutation privileges
 REVOKE ALL ON public.contacts, public.opt_outs, public.sms_campaigns FROM anon, PUBLIC;
-REVOKE DELETE, TRUNCATE ON public.contacts, public.opt_outs, public.sms_campaigns FROM authenticated;
-GRANT SELECT, INSERT, UPDATE ON public.contacts, public.opt_outs, public.sms_campaigns TO authenticated;
+REVOKE ALL ON public.contacts, public.opt_outs, public.sms_campaigns FROM authenticated;
+GRANT SELECT ON public.contacts, public.opt_outs, public.sms_campaigns TO authenticated;
+GRANT ALL ON public.contacts, public.opt_outs, public.sms_campaigns TO service_role;
 
--- Contacts Policies (Authenticated Only; No DELETE Policy)
+-- Contacts Policies (Strict Read-Only for Authenticated Users)
 DROP POLICY IF EXISTS "Operators can view contacts" ON public.contacts;
+DROP POLICY IF EXISTS "Authenticated users can insert contacts" ON public.contacts;
+DROP POLICY IF EXISTS "Authenticated users can update contacts" ON public.contacts;
+DROP POLICY IF EXISTS "Authenticated users can delete contacts" ON public.contacts;
 DROP POLICY IF EXISTS "Authenticated users can select contacts" ON public.contacts;
 CREATE POLICY "Authenticated users can select contacts"
     ON public.contacts FOR SELECT TO authenticated
     USING (auth.uid() IS NOT NULL);
 
-DROP POLICY IF EXISTS "Authenticated users can insert contacts" ON public.contacts;
-CREATE POLICY "Authenticated users can insert contacts"
-    ON public.contacts FOR INSERT TO authenticated
-    WITH CHECK (auth.uid() IS NOT NULL);
-
-DROP POLICY IF EXISTS "Authenticated users can update contacts" ON public.contacts;
-CREATE POLICY "Authenticated users can update contacts"
-    ON public.contacts FOR UPDATE TO authenticated
-    USING (auth.uid() IS NOT NULL)
-    WITH CHECK (auth.uid() IS NOT NULL);
-
--- Opt-Outs Policies (Authenticated Only; No DELETE Policy)
+-- Opt-Outs Policies (Strict Read-Only for Authenticated Users)
 DROP POLICY IF EXISTS "Authenticated operators can view opt_outs" ON public.opt_outs;
 DROP POLICY IF EXISTS "Operators can view opt_outs" ON public.opt_outs;
+DROP POLICY IF EXISTS "Operators can insert opt_outs" ON public.opt_outs;
+DROP POLICY IF EXISTS "Authenticated users can insert opt_outs" ON public.opt_outs;
+DROP POLICY IF EXISTS "Authenticated users can update opt_outs" ON public.opt_outs;
+DROP POLICY IF EXISTS "Authenticated users can delete opt_outs" ON public.opt_outs;
 DROP POLICY IF EXISTS "Authenticated users can select opt_outs" ON public.opt_outs;
 CREATE POLICY "Authenticated users can select opt_outs"
     ON public.opt_outs FOR SELECT TO authenticated
     USING (auth.uid() IS NOT NULL);
 
-DROP POLICY IF EXISTS "Operators can insert opt_outs" ON public.opt_outs;
-DROP POLICY IF EXISTS "Authenticated users can insert opt_outs" ON public.opt_outs;
-CREATE POLICY "Authenticated users can insert opt_outs"
-    ON public.opt_outs FOR INSERT TO authenticated
-    WITH CHECK (auth.uid() IS NOT NULL);
-
-DROP POLICY IF EXISTS "Authenticated users can update opt_outs" ON public.opt_outs;
-CREATE POLICY "Authenticated users can update opt_outs"
-    ON public.opt_outs FOR UPDATE TO authenticated
-    USING (auth.uid() IS NOT NULL)
-    WITH CHECK (auth.uid() IS NOT NULL);
-
--- SMS Campaigns Policies (Authenticated Only; Append/Read/Update Only — No DELETE Policy)
+-- SMS Campaigns Policies (Strict Read-Only for Authenticated Users)
 DROP POLICY IF EXISTS "Authenticated operators can view campaigns" ON public.sms_campaigns;
 DROP POLICY IF EXISTS "Operators can view campaigns" ON public.sms_campaigns;
+DROP POLICY IF EXISTS "Operators can insert campaigns" ON public.sms_campaigns;
+DROP POLICY IF EXISTS "Authenticated users can insert campaigns" ON public.sms_campaigns;
+DROP POLICY IF EXISTS "Operators can update campaigns" ON public.sms_campaigns;
+DROP POLICY IF EXISTS "Authenticated users can update campaigns" ON public.sms_campaigns;
+DROP POLICY IF EXISTS "Authenticated users can delete campaigns" ON public.sms_campaigns;
 DROP POLICY IF EXISTS "Authenticated users can select campaigns" ON public.sms_campaigns;
 CREATE POLICY "Authenticated users can select campaigns"
     ON public.sms_campaigns FOR SELECT TO authenticated
     USING (auth.uid() IS NOT NULL);
-
-DROP POLICY IF EXISTS "Operators can insert campaigns" ON public.sms_campaigns;
-DROP POLICY IF EXISTS "Authenticated users can insert campaigns" ON public.sms_campaigns;
-CREATE POLICY "Authenticated users can insert campaigns"
-    ON public.sms_campaigns FOR INSERT TO authenticated
-    WITH CHECK (auth.uid() IS NOT NULL AND user_id = auth.uid());
-
-DROP POLICY IF EXISTS "Operators can update campaigns" ON public.sms_campaigns;
-DROP POLICY IF EXISTS "Authenticated users can update campaigns" ON public.sms_campaigns;
-CREATE POLICY "Authenticated users can update campaigns"
-    ON public.sms_campaigns FOR UPDATE TO authenticated
-    USING (auth.uid() IS NOT NULL)
-    WITH CHECK (auth.uid() IS NOT NULL);

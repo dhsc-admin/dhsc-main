@@ -1,9 +1,19 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
+
+vi.hoisted(() => {
+  process.env.NEXT_PUBLIC_SUPABASE_URL ||= "https://example.supabase.co";
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||= "test-anon-key";
+});
+
 import {
   analyzeSmsSegments,
+  CampaignFormSchema,
   canCancelScheduledCampaign,
+  DEFAULT_SENDER_ID,
   evaluateCreditGate,
   isValidE164,
+  MAX_ALLOWED_CHARACTERS,
+  MAX_ALLOWED_SEGMENTS,
   sanitizeRecipients,
   validateScheduleTimestamp,
 } from "../sms-validation";
@@ -37,13 +47,27 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     expect(res.invalidFormatRejected).toEqual(["98100-INVALID"]);
   });
 
-  it("2. Accurately calculates GSM-7 (including extended chars like €) vs UCS-2 and blocks >5 segments", () => {
+  it("2. Accurately calculates GSM-7 (including extended chars like €) vs UCS-2 and enforces 150-char / 1-segment limit", () => {
+    expect(MAX_ALLOWED_CHARACTERS).toBe(150);
+    expect(MAX_ALLOWED_SEGMENTS).toBe(1);
+    expect(DEFAULT_SENDER_ID).toBe("Dilli Haat");
+
     const singleGsm = calculateMessageDetails("Hello Dilli Haat €10 voucher");
     expect(singleGsm.encoding).toBe("GSM-7");
     // "Hello Dilli Haat €10 voucher" is 28 chars, but '€' is 2 septets -> 29 effective units
     expect(singleGsm.charCount).toBe(28);
     expect(singleGsm.effectiveUnits).toBe(29);
     expect(singleGsm.segmentCount).toBe(1);
+    expect(singleGsm.isOverLimit).toBe(false);
+
+    const exact150Gsm = calculateMessageDetails("A".repeat(150));
+    expect(exact150Gsm.charCount).toBe(150);
+    expect(exact150Gsm.segmentCount).toBe(1);
+    expect(exact150Gsm.isOverLimit).toBe(false);
+
+    const over150Gsm = calculateMessageDetails("A".repeat(151));
+    expect(over150Gsm.charCount).toBe(151);
+    expect(over150Gsm.isOverLimit).toBe(true);
 
     const backtickUcs2 = calculateMessageDetails("Backtick ` forces UCS-2");
     expect(backtickUcs2.encoding).toBe("UCS-2 (Unicode)");
@@ -51,14 +75,26 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     const multiGsm = analyzeSmsSegments("A".repeat(161));
     expect(multiGsm.encoding).toBe("GSM-7");
     expect(multiGsm.segments).toBe(2);
+    expect(multiGsm.isOverMaxSegments).toBe(true);
 
     const singleUcs2 = analyzeSmsSegments("Hello 🔥");
     expect(singleUcs2.encoding).toBe("UCS-2");
     expect(singleUcs2.segments).toBe(1);
+    expect(singleUcs2.isOverMaxSegments).toBe(false);
 
-    const overflowGsm = calculateMessageDetails("A".repeat(153 * 5 + 1));
-    expect(overflowGsm.segmentCount).toBe(6);
-    expect(overflowGsm.isOverLimit).toBe(true);
+    const multiUcs2 = analyzeSmsSegments("🔥".repeat(36));
+    expect(multiUcs2.encoding).toBe("UCS-2");
+    expect(multiUcs2.segments).toBe(2);
+    expect(multiUcs2.isOverMaxSegments).toBe(true);
+
+    const parsedDefaults = CampaignFormSchema.parse({
+      name: "Weekend Haat",
+      audienceId: "all",
+      message: "Welcome to Dilli Haat!",
+      dispatchType: "immediate",
+      idempotencyKey: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+    });
+    expect(parsedDefaults.senderId).toBe("Dilli Haat");
   });
 
   it("3. Enforces Strict Credit Gatekeeping: Cost <= (Live Balance - Reserved Credits)", () => {

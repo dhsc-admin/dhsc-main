@@ -3,7 +3,9 @@ import { z } from "zod";
 /**
  * NON-NEGOTIABLE GUARDRAIL CONSTANTS
  */
-export const MAX_ALLOWED_SEGMENTS = 5;
+export const MAX_ALLOWED_CHARACTERS = 150;
+export const MAX_ALLOWED_SEGMENTS = 1;
+export const DEFAULT_SENDER_ID = "Dilli Haat";
 export const MIN_SCHEDULE_BUFFER_MINUTES = 15;
 export const MIN_CANCEL_BUFFER_MINUTES = 5;
 
@@ -55,11 +57,11 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
       rawCharacterCount: 0,
       effectiveUnitCount: 0,
       segments: 0,
-      maxUnitsPerSegment: 160,
+      maxUnitsPerSegment: MAX_ALLOWED_CHARACTERS,
       singleSegmentLimit: 160,
       multiSegmentLimit: 153,
-      remainingInCurrentSegment: 160,
-      maxAllowedUnitsTotal: 153 * MAX_ALLOWED_SEGMENTS,
+      remainingInCurrentSegment: MAX_ALLOWED_CHARACTERS,
+      maxAllowedUnitsTotal: MAX_ALLOWED_CHARACTERS,
       isOverMaxSegments: false,
       nonGsmCharacters: [],
       extendedGsmCharacters: [],
@@ -95,23 +97,30 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
   const effectiveUnitCount = isUcs2 ? text.length : gsmSeptets;
 
   let segments = 0;
-  let maxUnitsPerSegment = singleSegmentLimit;
+  let maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
 
   if (effectiveUnitCount === 0) {
     segments = 0;
   } else if (effectiveUnitCount <= singleSegmentLimit) {
     segments = 1;
-    maxUnitsPerSegment = singleSegmentLimit;
+    maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
   } else {
     segments = Math.ceil(effectiveUnitCount / multiSegmentLimit);
     maxUnitsPerSegment = multiSegmentLimit;
   }
 
-  const currentCapacity =
-    segments <= 1 ? singleSegmentLimit : segments * multiSegmentLimit;
-  const remainingInCurrentSegment = Math.max(0, currentCapacity - effectiveUnitCount);
-  const maxAllowedUnitsTotal = multiSegmentLimit * MAX_ALLOWED_SEGMENTS;
-  const isOverMaxSegments = segments > MAX_ALLOWED_SEGMENTS;
+  const maxAllowedUnitsTotal =
+    MAX_ALLOWED_SEGMENTS === 1
+      ? Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS)
+      : Math.min(multiSegmentLimit * MAX_ALLOWED_SEGMENTS, MAX_ALLOWED_CHARACTERS);
+  const remainingInCurrentSegment = Math.max(
+    0,
+    maxAllowedUnitsTotal - effectiveUnitCount
+  );
+  const isOverMaxSegments =
+    segments > MAX_ALLOWED_SEGMENTS ||
+    codePoints.length > MAX_ALLOWED_CHARACTERS ||
+    effectiveUnitCount > MAX_ALLOWED_CHARACTERS;
 
   return {
     encoding,
@@ -336,12 +345,22 @@ export const TestSmsSchema = z.object({
   message: z
     .string()
     .min(1, "Message body cannot be empty")
+    .max(
+      MAX_ALLOWED_CHARACTERS,
+      `Message cannot exceed ${MAX_ALLOWED_CHARACTERS} characters.`
+    )
     .superRefine((val, ctx) => {
       const analysis = analyzeSmsSegments(val);
+      if (analysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Message is ${analysis.rawCharacterCount} characters, exceeding the hard maximum of ${MAX_ALLOWED_CHARACTERS} characters.`,
+        });
+      }
       if (analysis.isOverMaxSegments) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `Message uses ${analysis.segments} segments (${analysis.encoding}), exceeding the maximum limit of ${MAX_ALLOWED_SEGMENTS} segments.`,
+          message: `Message uses ${analysis.segments} segments (${analysis.encoding}), exceeding the maximum limit of ${MAX_ALLOWED_SEGMENTS} segment (${MAX_ALLOWED_CHARACTERS} characters max).`,
         });
       }
     }),
@@ -361,18 +380,29 @@ export const CampaignFormSchema = z
       .string()
       .trim()
       .min(3, "Sender ID is required")
-      .max(15, "Sender ID must be <= 15 characters"),
+      .max(15, "Sender ID must be <= 15 characters")
+      .default(DEFAULT_SENDER_ID),
     audienceId: z.string().min(1, "Please select a recipient audience or custom list"),
     customRecipientsRaw: z.string().optional(),
     message: z
       .string()
       .min(1, "SMS message body is required")
+      .max(
+        MAX_ALLOWED_CHARACTERS,
+        `SMS message cannot exceed ${MAX_ALLOWED_CHARACTERS} characters.`
+      )
       .superRefine((val, ctx) => {
         const analysis = analyzeSmsSegments(val);
+        if (analysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Message is ${analysis.rawCharacterCount} characters, exceeding the hard maximum of ${MAX_ALLOWED_CHARACTERS} characters.`,
+          });
+        }
         if (analysis.isOverMaxSegments) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `Message requires ${analysis.segments} segments (${analysis.encoding}). Hard ceiling is ${MAX_ALLOWED_SEGMENTS} segments (${analysis.maxAllowedUnitsTotal} ${analysis.encoding === "UCS-2" ? "UCS-2 chars" : "GSM-7 septets"}).`,
+            message: `Message requires ${analysis.segments} segments (${analysis.encoding}). Hard ceiling is ${MAX_ALLOWED_SEGMENTS} segment (${MAX_ALLOWED_CHARACTERS} characters max).`,
           });
         }
       }),

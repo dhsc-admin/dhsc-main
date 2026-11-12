@@ -2,12 +2,16 @@
  * Supabase Edge Function: `sms-proxy`
  * Zero-Trust server-side proxy to the third-party `sms-rest 3.0` Bulk SMS API.
  *
- * Security Hardening (Phase 3 & Phase 4):
+ * Security Hardening (Phase 3, Phase 4 & Phase 5):
  * - Strict CORS allowlist (`http://localhost:3000` and production Vercel URL only).
  * - Cryptographic JWT verification via `supabaseAdmin.auth.getUser(token)` before any logic executes.
- * - Server-side `analyzeSmsSegments` & `totalCost` recalculation (zero trust of client-supplied segment/cost values).
- * - Server-side `opt_outs` blacklist verification (`403 Forbidden`) and 30-second per-user rate limiting (`429 Too Many Requests`) on `send_single_sms`.
- * - Enforces idempotency, E.164 sanitization, 15-minute schedule buffer, 5-minute cancel lock, and two-step `Schedule Delete`.
+ * - Hard 150-character (`MAX_ALLOWED_CHARACTERS = 150`) and 1-segment (`MAX_ALLOWED_SEGMENTS = 1`) business rule.
+ * - Default `senderId` set to `"Dilli Haat"`.
+ * - Server-side audience resolution from `public.contacts` / `customPhones` and `public.opt_outs` stripping.
+ * - Server-side `analyzeSmsSegments`, `valid_recipient_count`, and `totalCost` recalculation.
+ * - Server-side credit gatekeeper summing `scheduled` and `processing` rows (`402 Payment Required`).
+ * - Write-Ahead state machine (`status = 'processing'` -> provider dispatch -> `'sent'`/`'scheduled'` or `'failed'`).
+ * - Sanitized `500` error responses with server-side `console.error` logging.
  */
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -38,7 +42,9 @@ const isLiveProviderConfigured =
   !SMS_PROVIDER_BASE_URL.includes(".example");
 
 const E164_REGEX = /^\+[1-9]\d{6,14}$/;
-const MAX_ALLOWED_SEGMENTS = 5;
+const MAX_ALLOWED_CHARACTERS = 150;
+const MAX_ALLOWED_SEGMENTS = 1;
+const DEFAULT_SENDER_ID = "Dilli Haat";
 
 /**
  * Standard 3GPP TS 23.038 GSM-7 Default Alphabet (1 septet each)
@@ -76,7 +82,7 @@ interface SegmentAnalysis {
 
 /**
  * Server-side SMS segment analyzer (3GPP TS 23.038 GSM-7 vs UCS-2).
- * Never trust client-supplied `segmentCount` or `totalCost`.
+ * Enforces MAX_ALLOWED_CHARACTERS = 150 and MAX_ALLOWED_SEGMENTS = 1.
  */
 function analyzeSmsSegments(text: string): SegmentAnalysis {
   if (!text || text.length === 0) {
@@ -85,11 +91,11 @@ function analyzeSmsSegments(text: string): SegmentAnalysis {
       rawCharacterCount: 0,
       effectiveUnitCount: 0,
       segments: 0,
-      maxUnitsPerSegment: 160,
+      maxUnitsPerSegment: MAX_ALLOWED_CHARACTERS,
       singleSegmentLimit: 160,
       multiSegmentLimit: 153,
-      remainingInCurrentSegment: 160,
-      maxAllowedUnitsTotal: 153 * MAX_ALLOWED_SEGMENTS,
+      remainingInCurrentSegment: MAX_ALLOWED_CHARACTERS,
+      maxAllowedUnitsTotal: MAX_ALLOWED_CHARACTERS,
       isOverMaxSegments: false,
     };
   }
@@ -115,26 +121,33 @@ function analyzeSmsSegments(text: string): SegmentAnalysis {
   const effectiveUnitCount = isUcs2 ? text.length : gsmSeptets;
 
   let segments = 0;
-  let maxUnitsPerSegment = singleSegmentLimit;
+  let maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
 
   if (effectiveUnitCount === 0) {
     segments = 0;
   } else if (effectiveUnitCount <= singleSegmentLimit) {
     segments = 1;
-    maxUnitsPerSegment = singleSegmentLimit;
+    maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
   } else {
     segments = Math.ceil(effectiveUnitCount / multiSegmentLimit);
     maxUnitsPerSegment = multiSegmentLimit;
   }
 
-  const currentCapacity =
-    segments <= 1 ? singleSegmentLimit : segments * multiSegmentLimit;
+  const maxAllowedUnitsTotal =
+    MAX_ALLOWED_SEGMENTS === 1
+      ? Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS)
+      : Math.min(
+          multiSegmentLimit * MAX_ALLOWED_SEGMENTS,
+          MAX_ALLOWED_CHARACTERS
+        );
   const remainingInCurrentSegment = Math.max(
     0,
-    currentCapacity - effectiveUnitCount
+    maxAllowedUnitsTotal - effectiveUnitCount
   );
-  const maxAllowedUnitsTotal = multiSegmentLimit * MAX_ALLOWED_SEGMENTS;
-  const isOverMaxSegments = segments > MAX_ALLOWED_SEGMENTS;
+  const isOverMaxSegments =
+    segments > MAX_ALLOWED_SEGMENTS ||
+    codePoints.length > MAX_ALLOWED_CHARACTERS ||
+    effectiveUnitCount > MAX_ALLOWED_CHARACTERS;
 
   return {
     encoding,
@@ -180,6 +193,41 @@ interface CampaignCreditRow {
   estimated_credits?: number | null;
 }
 
+interface OptOutRow {
+  phone?: string | null;
+}
+
+interface ContactRow {
+  phone_e164?: string | null;
+  visit_count?: number | null;
+}
+
+interface ResolvedAudienceResult {
+  validPhoneArray: string[];
+  rawRecipientCount: number;
+  validRecipientCount: number;
+  duplicatesRemovedCount: number;
+  optedOutStrippedCount: number;
+  invalidRejectedCount: number;
+}
+
+function isDuplicateIdempotencyError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const pgErr = err as {
+    code?: string;
+    message?: string;
+    details?: string;
+    hint?: string;
+  };
+  if (pgErr.code === "23505") return true;
+  const combined = `${pgErr.message ?? ""} ${pgErr.details ?? ""} ${pgErr.hint ?? ""}`;
+  return /duplicate key|unique constraint|idempotency_key/i.test(combined);
+}
+
+/**
+ * Computes live provider balance and sums `estimated_credits` for all
+ * `scheduled` and `processing` rows in `public.sms_campaigns`.
+ */
 async function computeCreditLedger(
   supabaseAdmin: ReturnType<typeof createClient>
 ): Promise<{
@@ -195,7 +243,10 @@ async function computeCreditLedger(
 
   const rows: CampaignCreditRow[] = campaignRows ?? [];
   const reservedCredits = rows
-    .filter((r: CampaignCreditRow) => r.status === "scheduled")
+    .filter(
+      (r: CampaignCreditRow) =>
+        r.status === "scheduled" || r.status === "processing"
+    )
     .reduce(
       (sum: number, r: CampaignCreditRow) =>
         sum + Number(r.estimated_credits ?? 0),
@@ -234,12 +285,180 @@ async function computeCreditLedger(
   };
 }
 
+/**
+ * Resolves the actual recipient E.164 phone list on the server:
+ * - Fetches all `phone` values from `public.opt_outs` into a `Set`.
+ * - If `audienceId === "custom"`, validates E.164, deduplicates, and strips `opt_outs` from `customPhones`.
+ * - If `audienceId === "all"`, `"random"`, or `"top"`, queries `public.contacts` for `phone_e164`,
+ *   strips `opt_outs`, and applies the subset (`ORDER BY visit_count DESC LIMIT N` for `"top"`,
+ *   or Fisher-Yates shuffle `LIMIT N` for `"random"`).
+ */
+async function resolveAudienceRecipients(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  audienceId: string,
+  body: Record<string, unknown>
+): Promise<{ data?: ResolvedAudienceResult; clientError?: string }> {
+  const { data: optOutRows, error: optOutErr } = await supabaseAdmin
+    .from<OptOutRow>("opt_outs")
+    .select("phone");
+
+  if (optOutErr) throw optOutErr;
+
+  const optOutSet = new Set<string>(
+    (optOutRows ?? [])
+      .map((r: OptOutRow) =>
+        String(r.phone ?? "")
+          .trim()
+          .replace(/[\s()-]/g, "")
+      )
+      .filter(Boolean)
+  );
+
+  const seenValid = new Set<string>();
+  let validPhoneArray: string[] = [];
+  let rawRecipientCount = 0;
+  let duplicatesRemovedCount = 0;
+  let optedOutStrippedCount = 0;
+  let invalidRejectedCount = 0;
+
+  if (audienceId === "custom") {
+    if (!Array.isArray(body.customPhones)) {
+      return {
+        clientError:
+          "customPhones array is required when audienceId is 'custom'.",
+      };
+    }
+
+    for (const raw of body.customPhones) {
+      const normalized = String(raw ?? "")
+        .trim()
+        .replace(/[\s()-]/g, "");
+      if (!normalized) continue;
+      rawRecipientCount++;
+
+      if (!E164_REGEX.test(normalized)) {
+        invalidRejectedCount++;
+        continue;
+      }
+
+      if (seenValid.has(normalized)) {
+        duplicatesRemovedCount++;
+        continue;
+      }
+      seenValid.add(normalized);
+
+      if (optOutSet.has(normalized)) {
+        optedOutStrippedCount++;
+        continue;
+      }
+
+      validPhoneArray.push(normalized);
+    }
+  } else if (
+    audienceId === "all" ||
+    audienceId === "random" ||
+    audienceId === "top"
+  ) {
+    const contactsQuery = supabaseAdmin
+      .from<ContactRow>("contacts")
+      .select("phone_e164, visit_count");
+
+    const { data: contactRows, error: contactsErr } =
+      audienceId === "top" && typeof contactsQuery.order === "function"
+        ? await contactsQuery.order("visit_count", { ascending: false })
+        : await contactsQuery;
+
+    if (contactsErr) throw contactsErr;
+
+    const rows: ContactRow[] = [...(contactRows ?? [])];
+    if (audienceId === "top") {
+      rows.sort(
+        (a: ContactRow, b: ContactRow) =>
+          Number(b.visit_count ?? 0) - Number(a.visit_count ?? 0)
+      );
+    }
+
+    for (const row of rows) {
+      const normalized = String(row.phone_e164 ?? "")
+        .trim()
+        .replace(/[\s()-]/g, "");
+      if (!normalized) continue;
+      rawRecipientCount++;
+
+      if (!E164_REGEX.test(normalized)) {
+        invalidRejectedCount++;
+        continue;
+      }
+
+      if (seenValid.has(normalized)) {
+        duplicatesRemovedCount++;
+        continue;
+      }
+      seenValid.add(normalized);
+
+      if (optOutSet.has(normalized)) {
+        optedOutStrippedCount++;
+        continue;
+      }
+
+      validPhoneArray.push(normalized);
+    }
+
+    if (audienceId === "top" || audienceId === "random") {
+      const rawLimit =
+        body.audienceSize ??
+        body.limit ??
+        body.subsetSize ??
+        body.recipientsCount;
+      const limitN = Math.floor(Number(rawLimit ?? 0));
+      if (!Number.isFinite(limitN) || limitN <= 0) {
+        return {
+          clientError:
+            "A positive recipient subset limit is required for 'top' or 'random' audiences.",
+        };
+      }
+
+      if (audienceId === "random") {
+        // Fisher-Yates shuffle
+        for (let i = validPhoneArray.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          const temp = validPhoneArray[i];
+          validPhoneArray[i] = validPhoneArray[j];
+          validPhoneArray[j] = temp;
+        }
+      }
+
+      validPhoneArray = validPhoneArray.slice(0, limitN);
+    }
+  } else {
+    return {
+      clientError: `Unsupported audienceId '${audienceId}'. Must be 'all', 'random', 'top', or 'custom'.`,
+    };
+  }
+
+  const validRecipientCount = validPhoneArray.length;
+  rawRecipientCount = Math.max(rawRecipientCount, validRecipientCount);
+
+  return {
+    data: {
+      validPhoneArray,
+      rawRecipientCount,
+      validRecipientCount,
+      duplicatesRemovedCount,
+      optedOutStrippedCount,
+      invalidRejectedCount,
+    },
+  };
+}
+
 serve(async (req: Request): Promise<Response> => {
   const { corsHeaders, isAllowedOrigin } = getCorsConfig(req);
 
   if (!isAllowedOrigin) {
     return new Response(
-      JSON.stringify({ error: "Forbidden: Origin not permitted by CORS policy." }),
+      JSON.stringify({
+        error: "Forbidden: Origin not permitted by CORS policy.",
+      }),
       {
         status: 403,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -255,7 +474,7 @@ serve(async (req: Request): Promise<Response> => {
     const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
     // =========================================================================
-    // PHASE 3 TASK 2: Cryptographic JWT Verification (Zero-Trust Identity Check)
+    // Cryptographic JWT Verification (Zero-Trust Identity Check)
     // =========================================================================
     const authHeader =
       req.headers.get("Authorization") ?? req.headers.get("authorization") ?? "";
@@ -279,8 +498,7 @@ serve(async (req: Request): Promise<Response> => {
     if (authError || !authData?.user) {
       return new Response(
         JSON.stringify({
-          error:
-            authError?.message || "Unauthorized: Invalid or expired session token.",
+          error: "Unauthorized: Invalid or expired session token.",
         }),
         {
           status: 401,
@@ -310,8 +528,28 @@ serve(async (req: Request): Promise<Response> => {
 
     // 2. Send Single SMS / Schedule Single SMS (`send_single_sms`)
     if (action === "send_single_sms") {
-      const { idempotencyKey, phoneNumber, messageBody, message, scheduledAt } =
-        body;
+      const {
+        idempotencyKey,
+        phoneNumber,
+        messageBody,
+        message,
+        scheduledAt,
+        senderId = DEFAULT_SENDER_ID,
+      } = body;
+
+      const trimmedSenderId =
+        String(senderId ?? DEFAULT_SENDER_ID).trim() || DEFAULT_SENDER_ID;
+      if (trimmedSenderId.length < 3 || trimmedSenderId.length > 15) {
+        return new Response(
+          JSON.stringify({
+            error: "Sender ID must be between 3 and 15 characters.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
 
       const cleanPhone = String(phoneNumber ?? "").trim();
       if (!E164_REGEX.test(cleanPhone)) {
@@ -324,21 +562,22 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // PHASE 4 TASK 1: Server-side segment & cost recalculation (never trust client `segments` / `totalCost`)
+      // Server-side segment & character limit enforcement (max 150 chars, 1 segment)
       const resolvedMessage = String(messageBody ?? message ?? "");
       const segmentAnalysis = analyzeSmsSegments(resolvedMessage);
       const trueSegmentCount = segmentAnalysis.segments;
-      const trueTotalCost = trueSegmentCount;
+      const serverCalculatedCost = trueSegmentCount;
 
       if (
         !resolvedMessage ||
+        segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
         trueSegmentCount < 1 ||
         trueSegmentCount > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
           JSON.stringify({
-            error: `Message must be between 1 and ${MAX_ALLOWED_SEGMENTS} segments.`,
+            error: `Message must be between 1 and ${MAX_ALLOWED_CHARACTERS} characters and fit within ${MAX_ALLOWED_SEGMENTS} segment.`,
           }),
           {
             status: 400,
@@ -347,7 +586,7 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // PHASE 4 TASK 3: Server-Side Opt-Out Verification (returns 403 Forbidden if blacklisted)
+      // Server-Side Opt-Out Verification (returns 403 Forbidden if blacklisted)
       const { data: optedOutRow, error: optOutErr } = await supabaseAdmin
         .from("opt_outs")
         .select("phone")
@@ -368,7 +607,7 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // PHASE 4 TASK 4: Basic Rate Limiting Guardrail (max 1 single SMS per 30 seconds per user)
+      // Basic Rate Limiting Guardrail (max 1 single SMS per 30 seconds per user)
       const thirtySecondsAgoIso = new Date(
         Date.now() - 30 * 1000
       ).toISOString();
@@ -413,8 +652,9 @@ serve(async (req: Request): Promise<Response> => {
         }
       }
 
+      // Server-Side Credit Check (liveBalance - reservedCredits where reservedCredits includes scheduled + processing)
       const ledger = await computeCreditLedger(supabaseAdmin);
-      if (ledger.effectiveAvailableCredits < trueTotalCost) {
+      if (serverCalculatedCost > ledger.liveBalance - ledger.reservedCredits) {
         return new Response(
           JSON.stringify({
             error: "Insufficient effective credits for test SMS.",
@@ -429,7 +669,7 @@ serve(async (req: Request): Promise<Response> => {
       let messageId = `${scheduledAt ? "sched-msg" : "msg"}-${Date.now()}`;
       let newBalance = scheduledAt
         ? ledger.liveBalance
-        : Math.max(0, ledger.liveBalance - trueTotalCost);
+        : Math.max(0, ledger.liveBalance - serverCalculatedCost);
 
       if (isLiveProviderConfigured) {
         const endpoint = scheduledAt
@@ -447,9 +687,10 @@ serve(async (req: Request): Promise<Response> => {
           },
           body: JSON.stringify({
             to: cleanPhone,
+            senderId: trimmedSenderId,
             message: resolvedMessage,
             segments: trueSegmentCount,
-            totalCost: trueTotalCost,
+            totalCost: serverCalculatedCost,
             scheduledAt: scheduledAt ?? undefined,
           }),
         });
@@ -485,7 +726,7 @@ serve(async (req: Request): Promise<Response> => {
           idempotency_key: idempotencyKey || crypto.randomUUID(),
           user_id: authenticatedUser.id,
           name: "Single Test SMS",
-          sender_id: "DILLIHAAT",
+          sender_id: trimmedSenderId,
           audience_id: "single_test",
           audience_name: cleanPhone,
           message: resolvedMessage,
@@ -505,14 +746,27 @@ serve(async (req: Request): Promise<Response> => {
           dispatched_at: scheduledAt ? null : new Date().toISOString(),
         });
 
-      if (singleInsertErr) throw singleInsertErr;
+      if (singleInsertErr) {
+        if (isDuplicateIdempotencyError(singleInsertErr)) {
+          return new Response(
+            JSON.stringify({
+              error: "Duplicate request blocked by Idempotency Key guardrail.",
+            }),
+            {
+              status: 409,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+        throw singleInsertErr;
+      }
 
       return new Response(
         JSON.stringify({
           success: true,
           messageId,
           segmentCount: trueSegmentCount,
-          totalCost: trueTotalCost,
+          totalCost: serverCalculatedCost,
           newBalance,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -524,27 +778,18 @@ serve(async (req: Request): Promise<Response> => {
       const {
         idempotencyKey,
         name,
-        senderId = "DILLIHAAT",
+        senderId = DEFAULT_SENDER_ID,
         audienceId = "all",
         audienceName = "All Contacts",
-        recipientsCount,
-        rawRecipientCount,
-        duplicatesRemoved = 0,
-        optedOutStripped = 0,
-        invalidRejected = 0,
         message,
       } = body;
 
       const trimmedName = String(name ?? "").trim();
-      const validCount = Number(recipientsCount ?? 0);
+      const trimmedSenderId =
+        String(senderId ?? DEFAULT_SENDER_ID).trim() || DEFAULT_SENDER_ID;
       const messageText = String(message ?? "");
 
-      // PHASE 4 TASK 1: Server-side segment & cost recalculation (ignores client `segmentCount` and `totalCost`)
-      const segmentAnalysis = analyzeSmsSegments(messageText);
-      const trueSegments = segmentAnalysis.segments;
-      const trueTotalCost = validCount * trueSegments;
-
-      if (!idempotencyKey || !trimmedName || !messageText || validCount <= 0) {
+      if (!idempotencyKey || !trimmedName || !messageText) {
         return new Response(
           JSON.stringify({ error: "Missing required campaign fields." }),
           {
@@ -566,13 +811,11 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      if (
-        trueSegments < 1 ||
-        trueSegments > MAX_ALLOWED_SEGMENTS ||
-        segmentAnalysis.isOverMaxSegments
-      ) {
+      if (trimmedSenderId.length < 3 || trimmedSenderId.length > 15) {
         return new Response(
-          JSON.stringify({ error: "Campaign exceeds 5-segment ceiling." }),
+          JSON.stringify({
+            error: "Sender ID must be between 3 and 15 characters.",
+          }),
           {
             status: 400,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -580,30 +823,79 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Check idempotency key in Supabase before dispatching
-      const { data: existingDup } = await supabaseAdmin
-        .from("sms_campaigns")
-        .select("id")
-        .eq("idempotency_key", String(idempotencyKey))
-        .maybeSingle();
+      // Server-side segment & character limit enforcement (max 150 chars, 1 segment)
+      const segmentAnalysis = analyzeSmsSegments(messageText);
+      const trueSegments = segmentAnalysis.segments;
 
-      if (existingDup) {
+      if (
+        segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
+        trueSegments < 1 ||
+        trueSegments > MAX_ALLOWED_SEGMENTS ||
+        segmentAnalysis.isOverMaxSegments
+      ) {
         return new Response(
           JSON.stringify({
-            error: "Duplicate request blocked by Idempotency Key guardrail.",
+            error: `Campaign message exceeds the ${MAX_ALLOWED_CHARACTERS}-character / ${MAX_ALLOWED_SEGMENTS}-segment ceiling.`,
           }),
           {
-            status: 409,
+            status: 400,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
           }
         );
       }
 
-      const ledger = await computeCreditLedger(supabaseAdmin);
-      if (ledger.effectiveAvailableCredits < trueTotalCost) {
+      // Server-side audience resolution & opt-out stripping
+      const resolvedAudience = await resolveAudienceRecipients(
+        supabaseAdmin,
+        String(audienceId),
+        body
+      );
+
+      if (resolvedAudience.clientError || !resolvedAudience.data) {
         return new Response(
           JSON.stringify({
-            error: `Insufficient effective credits: need ${trueTotalCost}, have ${ledger.effectiveAvailableCredits}.`,
+            error:
+              resolvedAudience.clientError ||
+              "Failed to resolve campaign recipients.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const {
+        validPhoneArray,
+        rawRecipientCount,
+        validRecipientCount: validCount,
+        duplicatesRemovedCount,
+        optedOutStrippedCount,
+        invalidRejectedCount,
+      } = resolvedAudience.data;
+
+      if (validCount <= 0) {
+        return new Response(
+          JSON.stringify({
+            error: "No valid opted-in recipients resolved for this campaign.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const serverCalculatedCost = validCount * trueSegments;
+
+      // Server-Side Credit Gatekeeper (`scheduled` + `processing` reserved credits)
+      const ledger = await computeCreditLedger(supabaseAdmin);
+      if (serverCalculatedCost > ledger.liveBalance - ledger.reservedCredits) {
+        return new Response(
+          JSON.stringify({
+            error: `Insufficient effective credits: need ${serverCalculatedCost}, have ${
+              ledger.liveBalance - ledger.reservedCredits
+            }.`,
           }),
           {
             status: 402,
@@ -612,32 +904,103 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      let batchId = `batch-${Date.now()}`;
-      let newBalance = Math.max(0, ledger.liveBalance - trueTotalCost);
+      // Write-Ahead State Machine Step 1: INSERT with `status = 'processing'`
+      const { data: processingCampaign, error: insertErr } = await supabaseAdmin
+        .from("sms_campaigns")
+        .insert({
+          idempotency_key: idempotencyKey,
+          user_id: authenticatedUser.id,
+          name: trimmedName,
+          sender_id: trimmedSenderId,
+          audience_id: String(audienceId),
+          audience_name: String(audienceName),
+          message: messageText,
+          encoding: segmentAnalysis.encoding,
+          character_count: segmentAnalysis.rawCharacterCount,
+          effective_unit_count: segmentAnalysis.effectiveUnitCount,
+          segments: trueSegments,
+          raw_recipient_count: rawRecipientCount,
+          valid_recipient_count: validCount,
+          duplicates_removed_count: duplicatesRemovedCount,
+          opted_out_stripped_count: optedOutStrippedCount,
+          invalid_rejected_count: invalidRejectedCount,
+          dispatch_type: "immediate",
+          status: "processing",
+        })
+        .select()
+        .single();
 
-      if (isLiveProviderConfigured) {
-        const providerRes = await fetch(
-          `${SMS_PROVIDER_BASE_URL}/campaigns/send`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
-              "Content-Type": "application/json",
-              "X-Idempotency-Key": String(idempotencyKey),
-            },
-            body: JSON.stringify({
-              idempotencyKey,
-              name: trimmedName,
-              senderId,
-              recipientsCount: validCount,
-              segmentCount: trueSegments,
-              totalCost: trueTotalCost,
-              message: messageText,
+      if (insertErr) {
+        if (isDuplicateIdempotencyError(insertErr)) {
+          return new Response(
+            JSON.stringify({
+              error: "Duplicate request blocked by Idempotency Key guardrail.",
             }),
-          }
-        );
+            {
+              status: 409,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+        throw insertErr;
+      }
+
+      let batchId = `batch-${Date.now()}`;
+      let newBalance = Math.max(0, ledger.liveBalance - serverCalculatedCost);
+
+      // Write-Ahead State Machine Step 2: Call external SMS provider API
+      if (isLiveProviderConfigured) {
+        let providerRes: Response;
+        try {
+          providerRes = await fetch(
+            `${SMS_PROVIDER_BASE_URL}/campaigns/send`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
+                "Content-Type": "application/json",
+                "X-Idempotency-Key": String(idempotencyKey),
+              },
+              body: JSON.stringify({
+                idempotencyKey,
+                name: trimmedName,
+                senderId: trimmedSenderId,
+                recipients: validPhoneArray,
+                recipientsCount: validCount,
+                segmentCount: trueSegments,
+                totalCost: serverCalculatedCost,
+                message: messageText,
+              }),
+            }
+          );
+        } catch (networkErr) {
+          console.error(networkErr);
+          await supabaseAdmin
+            .from("sms_campaigns")
+            .update({
+              status: "failed",
+              failure_reason: "Network error communicating with SMS provider.",
+            })
+            .eq("id", processingCampaign.id);
+
+          return new Response(
+            JSON.stringify({ error: "Provider bulk SMS dispatch failed." }),
+            {
+              status: 502,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
 
         if (!providerRes.ok) {
+          await supabaseAdmin
+            .from("sms_campaigns")
+            .update({
+              status: "failed",
+              failure_reason: `Provider returned HTTP ${providerRes.status} during bulk SMS dispatch.`,
+            })
+            .eq("id", processingCampaign.id);
+
           return new Response(
             JSON.stringify({ error: "Provider bulk SMS dispatch failed." }),
             {
@@ -663,48 +1026,29 @@ serve(async (req: Request): Promise<Response> => {
         }
       }
 
-      const rawCount = Math.max(
-        validCount,
-        Number(rawRecipientCount ?? validCount)
-      );
-
-      const { data: insertedCampaign, error: insertErr } = await supabaseAdmin
+      // Write-Ahead State Machine Step 3: UPDATE row to `status = 'sent'`
+      const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
-        .insert({
-          idempotency_key: idempotencyKey,
-          user_id: authenticatedUser.id,
-          name: trimmedName,
-          sender_id: senderId,
-          audience_id: audienceId,
-          audience_name: audienceName,
-          message: messageText,
-          encoding: segmentAnalysis.encoding,
-          character_count: segmentAnalysis.rawCharacterCount,
-          effective_unit_count: segmentAnalysis.effectiveUnitCount,
-          segments: trueSegments,
-          raw_recipient_count: rawCount,
-          valid_recipient_count: validCount,
-          duplicates_removed_count: Number(duplicatesRemoved),
-          opted_out_stripped_count: Number(optedOutStripped),
-          invalid_rejected_count: Number(invalidRejected),
-          dispatch_type: "immediate",
+        .update({
           status: "sent",
           provider_campaign_id: batchId,
           dispatched_at: new Date().toISOString(),
         })
+        .eq("id", processingCampaign.id)
         .select()
         .single();
 
-      if (insertErr) throw insertErr;
+      if (updateErr) throw updateErr;
 
       return new Response(
         JSON.stringify({
           success: true,
           batchId,
+          recipientsCount: validCount,
           segmentCount: trueSegments,
-          totalCost: trueTotalCost,
+          totalCost: serverCalculatedCost,
           newBalance,
-          campaign: insertedCampaign,
+          campaign: finalizedCampaign,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -715,34 +1059,19 @@ serve(async (req: Request): Promise<Response> => {
       const {
         idempotencyKey,
         name,
-        senderId = "DILLIHAAT",
+        senderId = DEFAULT_SENDER_ID,
         audienceId = "all",
         audienceName = "All Contacts",
-        recipientsCount,
-        rawRecipientCount,
-        duplicatesRemoved = 0,
-        optedOutStripped = 0,
-        invalidRejected = 0,
         message,
         scheduledAt,
       } = body;
 
       const trimmedName = String(name ?? "").trim();
-      const validCount = Number(recipientsCount ?? 0);
+      const trimmedSenderId =
+        String(senderId ?? DEFAULT_SENDER_ID).trim() || DEFAULT_SENDER_ID;
       const messageText = String(message ?? "");
 
-      // PHASE 4 TASK 1: Server-side segment & cost recalculation (ignores client `segmentCount` and `totalCost`)
-      const segmentAnalysis = analyzeSmsSegments(messageText);
-      const trueSegments = segmentAnalysis.segments;
-      const trueTotalCost = validCount * trueSegments;
-
-      if (
-        !idempotencyKey ||
-        !trimmedName ||
-        !messageText ||
-        !scheduledAt ||
-        validCount <= 0
-      ) {
+      if (!idempotencyKey || !trimmedName || !messageText || !scheduledAt) {
         return new Response(
           JSON.stringify({
             error: "Missing required scheduled campaign fields.",
@@ -766,13 +1095,32 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
+      if (trimmedSenderId.length < 3 || trimmedSenderId.length > 15) {
+        return new Response(
+          JSON.stringify({
+            error: "Sender ID must be between 3 and 15 characters.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // Server-side segment & character limit enforcement (max 150 chars, 1 segment)
+      const segmentAnalysis = analyzeSmsSegments(messageText);
+      const trueSegments = segmentAnalysis.segments;
+
       if (
+        segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
         trueSegments < 1 ||
         trueSegments > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
-          JSON.stringify({ error: "Campaign exceeds 5-segment ceiling." }),
+          JSON.stringify({
+            error: `Campaign message exceeds the ${MAX_ALLOWED_CHARACTERS}-character / ${MAX_ALLOWED_SEGMENTS}-segment ceiling.`,
+          }),
           {
             status: 400,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -795,30 +1143,58 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Check idempotency key in Supabase before scheduling
-      const { data: existingDup } = await supabaseAdmin
-        .from("sms_campaigns")
-        .select("id")
-        .eq("idempotency_key", String(idempotencyKey))
-        .maybeSingle();
+      // Server-side audience resolution & opt-out stripping
+      const resolvedAudience = await resolveAudienceRecipients(
+        supabaseAdmin,
+        String(audienceId),
+        body
+      );
 
-      if (existingDup) {
+      if (resolvedAudience.clientError || !resolvedAudience.data) {
         return new Response(
           JSON.stringify({
-            error: "Duplicate request blocked by Idempotency Key guardrail.",
+            error:
+              resolvedAudience.clientError ||
+              "Failed to resolve campaign recipients.",
           }),
           {
-            status: 409,
+            status: 400,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
           }
         );
       }
 
-      const ledger = await computeCreditLedger(supabaseAdmin);
-      if (ledger.effectiveAvailableCredits < trueTotalCost) {
+      const {
+        validPhoneArray,
+        rawRecipientCount,
+        validRecipientCount: validCount,
+        duplicatesRemovedCount,
+        optedOutStrippedCount,
+        invalidRejectedCount,
+      } = resolvedAudience.data;
+
+      if (validCount <= 0) {
         return new Response(
           JSON.stringify({
-            error: `Insufficient effective credits: need ${trueTotalCost}, have ${ledger.effectiveAvailableCredits}.`,
+            error: "No valid opted-in recipients resolved for this campaign.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const serverCalculatedCost = validCount * trueSegments;
+
+      // Server-Side Credit Gatekeeper (`scheduled` + `processing` reserved credits)
+      const ledger = await computeCreditLedger(supabaseAdmin);
+      if (serverCalculatedCost > ledger.liveBalance - ledger.reservedCredits) {
+        return new Response(
+          JSON.stringify({
+            error: `Insufficient effective credits: need ${serverCalculatedCost}, have ${
+              ledger.liveBalance - ledger.reservedCredits
+            }.`,
           }),
           {
             status: 402,
@@ -827,32 +1203,104 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
+      // Write-Ahead State Machine Step 1: INSERT with `status = 'processing'`
+      const { data: processingCampaign, error: insertErr } = await supabaseAdmin
+        .from("sms_campaigns")
+        .insert({
+          idempotency_key: idempotencyKey,
+          user_id: authenticatedUser.id,
+          name: trimmedName,
+          sender_id: trimmedSenderId,
+          audience_id: String(audienceId),
+          audience_name: String(audienceName),
+          message: messageText,
+          encoding: segmentAnalysis.encoding,
+          character_count: segmentAnalysis.rawCharacterCount,
+          effective_unit_count: segmentAnalysis.effectiveUnitCount,
+          segments: trueSegments,
+          raw_recipient_count: rawRecipientCount,
+          valid_recipient_count: validCount,
+          duplicates_removed_count: duplicatesRemovedCount,
+          opted_out_stripped_count: optedOutStrippedCount,
+          invalid_rejected_count: invalidRejectedCount,
+          dispatch_type: "scheduled",
+          status: "processing",
+          scheduled_at: scheduledAt,
+        })
+        .select()
+        .single();
+
+      if (insertErr) {
+        if (isDuplicateIdempotencyError(insertErr)) {
+          return new Response(
+            JSON.stringify({
+              error: "Duplicate request blocked by Idempotency Key guardrail.",
+            }),
+            {
+              status: 409,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+        throw insertErr;
+      }
+
       let providerCampaignId = `sched-${Date.now()}`;
 
+      // Write-Ahead State Machine Step 2: Call external SMS provider API
       if (isLiveProviderConfigured) {
-        const providerRes = await fetch(
-          `${SMS_PROVIDER_BASE_URL}/campaigns/schedule`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
-              "Content-Type": "application/json",
-              "X-Idempotency-Key": String(idempotencyKey),
-            },
-            body: JSON.stringify({
-              idempotencyKey,
-              name: trimmedName,
-              senderId,
-              recipientsCount: validCount,
-              segmentCount: trueSegments,
-              totalCost: trueTotalCost,
-              message: messageText,
-              scheduledAt,
-            }),
-          }
-        );
+        let providerRes: Response;
+        try {
+          providerRes = await fetch(
+            `${SMS_PROVIDER_BASE_URL}/campaigns/schedule`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${SMS_PROVIDER_API_KEY}`,
+                "Content-Type": "application/json",
+                "X-Idempotency-Key": String(idempotencyKey),
+              },
+              body: JSON.stringify({
+                idempotencyKey,
+                name: trimmedName,
+                senderId: trimmedSenderId,
+                recipients: validPhoneArray,
+                recipientsCount: validCount,
+                segmentCount: trueSegments,
+                totalCost: serverCalculatedCost,
+                message: messageText,
+                scheduledAt,
+              }),
+            }
+          );
+        } catch (networkErr) {
+          console.error(networkErr);
+          await supabaseAdmin
+            .from("sms_campaigns")
+            .update({
+              status: "failed",
+              failure_reason: "Network error communicating with SMS provider.",
+            })
+            .eq("id", processingCampaign.id);
+
+          return new Response(
+            JSON.stringify({ error: "Provider campaign scheduling failed." }),
+            {
+              status: 502,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
 
         if (!providerRes.ok) {
+          await supabaseAdmin
+            .from("sms_campaigns")
+            .update({
+              status: "failed",
+              failure_reason: `Provider returned HTTP ${providerRes.status} during campaign scheduling.`,
+            })
+            .eq("id", processingCampaign.id);
+
           return new Response(
             JSON.stringify({ error: "Provider campaign scheduling failed." }),
             {
@@ -869,47 +1317,27 @@ serve(async (req: Request): Promise<Response> => {
           providerCampaignId;
       }
 
-      const rawCount = Math.max(
-        validCount,
-        Number(rawRecipientCount ?? validCount)
-      );
-
-      const { data: insertedCampaign, error: insertErr } = await supabaseAdmin
+      // Write-Ahead State Machine Step 3: UPDATE row to `status = 'scheduled'`
+      const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
-        .insert({
-          idempotency_key: idempotencyKey,
-          user_id: authenticatedUser.id,
-          name: trimmedName,
-          sender_id: senderId,
-          audience_id: audienceId,
-          audience_name: audienceName,
-          message: messageText,
-          encoding: segmentAnalysis.encoding,
-          character_count: segmentAnalysis.rawCharacterCount,
-          effective_unit_count: segmentAnalysis.effectiveUnitCount,
-          segments: trueSegments,
-          raw_recipient_count: rawCount,
-          valid_recipient_count: validCount,
-          duplicates_removed_count: Number(duplicatesRemoved),
-          opted_out_stripped_count: Number(optedOutStripped),
-          invalid_rejected_count: Number(invalidRejected),
-          dispatch_type: "scheduled",
+        .update({
           status: "scheduled",
           provider_campaign_id: providerCampaignId,
-          scheduled_at: scheduledAt,
         })
+        .eq("id", processingCampaign.id)
         .select()
         .single();
 
-      if (insertErr) throw insertErr;
+      if (updateErr) throw updateErr;
 
       return new Response(
         JSON.stringify({
           success: true,
           providerCampaignId,
+          recipientsCount: validCount,
           segmentCount: trueSegments,
-          totalCost: trueTotalCost,
-          campaign: insertedCampaign,
+          totalCost: serverCalculatedCost,
+          campaign: finalizedCampaign,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -1071,10 +1499,11 @@ serve(async (req: Request): Promise<Response> => {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
-  } catch (err) {
+  } catch (error) {
+    console.error(error);
     return new Response(
       JSON.stringify({
-        error: err instanceof Error ? err.message : "Unexpected error",
+        error: "Internal server error processing SMS request.",
       }),
       {
         status: 500,

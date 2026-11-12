@@ -6,9 +6,11 @@ import { supabase } from "../lib/supabase";
 import {
   analyzeSmsSegments,
   canCancelScheduledCampaign,
+  DEFAULT_SENDER_ID,
   E164_REGEX,
   evaluateCreditGate,
   isValidE164,
+  MAX_ALLOWED_CHARACTERS,
   MAX_ALLOWED_SEGMENTS,
   MIN_CANCEL_BUFFER_MINUTES,
   MIN_SCHEDULE_BUFFER_MINUTES,
@@ -99,7 +101,7 @@ export interface CampaignItem {
   id: string;
   idempotencyKey: string;
   name: string;
-  status: "scheduled" | "sent" | "cancelled" | "failed";
+  status: "processing" | "scheduled" | "sent" | "cancelled" | "failed";
   recipientsCount: number;
   optedOutStripped: number;
   duplicatesRemoved: number;
@@ -219,11 +221,13 @@ export const ApiServices = {
     messageBody: string;
     segments: number;
     scheduledAt: string | null;
+    senderId?: string;
   }): Promise<{ success: boolean; messageId: string; newBalance?: number }> => {
     const { data, error } = await supabase.functions.invoke("sms-proxy", {
       body: {
         action: "send_single_sms",
         idempotencyKey: payload.idempotencyKey,
+        senderId: payload.senderId ?? DEFAULT_SENDER_ID,
         phoneNumber: payload.phoneNumber,
         messageBody: payload.messageBody,
         segments: payload.segments,
@@ -254,6 +258,7 @@ export const ApiServices = {
   sendBulkSMS: async (payload: {
     idempotencyKey: string;
     name: string;
+    senderId?: string;
     recipientsCount: number;
     segmentCount: number;
     totalCost: number;
@@ -267,6 +272,8 @@ export const ApiServices = {
     invalidRejected?: number;
     audienceId?: string;
     audienceName?: string;
+    audienceSize?: number;
+    customPhones?: string[];
   }): Promise<{
     success: boolean;
     campaignId?: string;
@@ -278,6 +285,7 @@ export const ApiServices = {
         action: "send_bulk_sms",
         idempotencyKey: payload.idempotencyKey,
         name: payload.name,
+        senderId: payload.senderId ?? DEFAULT_SENDER_ID,
         recipientsCount: payload.recipientsCount,
         segmentCount: payload.segmentCount,
         totalCost: payload.totalCost,
@@ -291,6 +299,8 @@ export const ApiServices = {
         invalidRejected: payload.invalidRejected,
         audienceId: payload.audienceId,
         audienceName: payload.audienceName,
+        audienceSize: payload.audienceSize,
+        customPhones: payload.customPhones,
       },
     });
     if (error) {
@@ -319,6 +329,7 @@ export const ApiServices = {
   scheduleBulkSMS: async (payload: {
     idempotencyKey: string;
     name: string;
+    senderId?: string;
     recipientsCount: number;
     segmentCount: number;
     totalCost: number;
@@ -333,6 +344,8 @@ export const ApiServices = {
     invalidRejected?: number;
     audienceId?: string;
     audienceName?: string;
+    audienceSize?: number;
+    customPhones?: string[];
   }): Promise<{
     success: boolean;
     campaignId?: string;
@@ -343,6 +356,7 @@ export const ApiServices = {
         action: "schedule_bulk_sms",
         idempotencyKey: payload.idempotencyKey,
         name: payload.name,
+        senderId: payload.senderId ?? DEFAULT_SENDER_ID,
         recipientsCount: payload.recipientsCount,
         segmentCount: payload.segmentCount,
         totalCost: payload.totalCost,
@@ -357,6 +371,8 @@ export const ApiServices = {
         invalidRejected: payload.invalidRejected,
         audienceId: payload.audienceId,
         audienceName: payload.audienceName,
+        audienceSize: payload.audienceSize,
+        customPhones: payload.customPhones,
       },
     });
     if (error) {
@@ -661,7 +677,7 @@ export default function BulkSMSManager({
   // --- Derived State: Credits & Queue Health ---
   const reservedCredits = useMemo(() => {
     return campaigns
-      .filter((c) => c.status === "scheduled")
+      .filter((c) => c.status === "scheduled" || c.status === "processing")
       .reduce((sum, c) => sum + c.totalCost, 0);
   }, [campaigns]);
 
@@ -809,11 +825,16 @@ export default function BulkSMSManager({
 
       let providerRef = "";
       let campaignId = generateUUID();
+      const parsedSubsetSize =
+        audienceType === "random" || audienceType === "top"
+          ? parseInt(audienceSize, 10) || recipientCount
+          : undefined;
 
       if (isScheduled) {
         const apiResult = await ApiServices.scheduleBulkSMS({
           idempotencyKey,
           name: name.trim(),
+          senderId: DEFAULT_SENDER_ID,
           recipientsCount: recipientCount,
           segmentCount: msgDetails.segmentCount,
           totalCost: estimatedCost,
@@ -828,6 +849,7 @@ export default function BulkSMSManager({
           invalidRejected: audienceSanitization.invalidCount,
           audienceId: audienceType,
           audienceName: audienceLabel,
+          audienceSize: parsedSubsetSize,
         });
         providerRef = apiResult.providerCampaignId;
         if (apiResult.campaignId) {
@@ -837,6 +859,7 @@ export default function BulkSMSManager({
         const apiResult = await ApiServices.sendBulkSMS({
           idempotencyKey,
           name: name.trim(),
+          senderId: DEFAULT_SENDER_ID,
           recipientsCount: recipientCount,
           segmentCount: msgDetails.segmentCount,
           totalCost: estimatedCost,
@@ -850,6 +873,7 @@ export default function BulkSMSManager({
           invalidRejected: audienceSanitization.invalidCount,
           audienceId: audienceType,
           audienceName: audienceLabel,
+          audienceSize: parsedSubsetSize,
         });
         providerRef = apiResult.batchId;
         if (apiResult.campaignId) {
@@ -1039,20 +1063,7 @@ export default function BulkSMSManager({
     }
     setIsAddingOptOut(true);
     try {
-      // Insert new opt-out number into the Supabase `opt_outs` table
-      const { error: dbError } = await supabase.from("opt_outs").insert([
-        {
-          phone: clean,
-          reason: "User opted out",
-          source: "manual_admin",
-          provider_synced: true,
-        },
-      ]);
-      if (dbError) {
-        throw new Error(dbError.message);
-      }
-
-      // Sync with sms-rest 3.0 Optout Number via Edge Function
+      // Sync with sms-rest 3.0 Optout Number and Supabase `opt_outs` via Edge Function (`service_role`)
       await ApiServices.optoutNumber(clean);
       setOptOuts((prev) => (prev.includes(clean) ? prev : [clean, ...prev]));
       setNewOptOutPhone("");
@@ -1468,7 +1479,7 @@ export default function BulkSMSManager({
                     Message Body
                   </label>
                   <span className="text-xs text-slate-500">
-                    Max {MAX_ALLOWED_SEGMENTS} segments
+                    Max {MAX_ALLOWED_CHARACTERS} chars ({MAX_ALLOWED_SEGMENTS} segment)
                   </span>
                 </div>
                 <textarea
@@ -1485,7 +1496,7 @@ export default function BulkSMSManager({
                 {msgDetails.isOverLimit && (
                   <p className="mt-1.5 text-xs text-red-600 font-medium flex items-center gap-1">
                     <Icons.AlertTriangle className="w-4 h-4 shrink-0" />
-                    Message exceeds the maximum limit of {MAX_ALLOWED_SEGMENTS} segments ({msgDetails.segmentCount} segments). Please shorten the message.
+                    Message exceeds the maximum limit of {MAX_ALLOWED_CHARACTERS} characters / {MAX_ALLOWED_SEGMENTS} segment ({msgDetails.charCount} chars, {msgDetails.segmentCount} segments). Please shorten the message.
                   </p>
                 )}
 
