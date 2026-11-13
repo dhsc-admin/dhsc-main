@@ -27,15 +27,12 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY =
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-const PRODUCTION_VERCEL_URL =
-  Deno.env.get("PRODUCTION_VERCEL_URL") ??
-  Deno.env.get("ALLOWED_ORIGIN") ??
-  "https://dilli-haat-sms-campaign.vercel.app";
-
-const ALLOWED_ORIGINS = new Set<string>([
+const ALLOWED_ORIGINS = [
   "http://localhost:3000",
-  PRODUCTION_VERCEL_URL,
-]);
+  "https://dilli-haat-sms-campaign.vercel.app",
+  "https://dhsc.uk",
+  "https://www.dhsc.uk",
+];
 
 const E164_REGEX = /^\+[1-9]\d{6,14}$/;
 const MAX_ALLOWED_CHARACTERS = 150;
@@ -175,17 +172,16 @@ function chunkPhoneNumbers(
 }
 
 /**
- * Strict CORS Enforcement: Only allow `http://localhost:3000` and the production Vercel URL.
+ * Strict CORS Enforcement: Dynamically accept requests from `ALLOWED_ORIGINS`.
  */
 function getCorsConfig(req: Request): {
   corsHeaders: Record<string, string>;
   isAllowedOrigin: boolean;
 } {
-  const origin = req.headers.get("Origin") ?? req.headers.get("origin") ?? "";
-  const isAllowedOrigin = !origin || ALLOWED_ORIGINS.has(origin);
-  const resolvedOrigin = ALLOWED_ORIGINS.has(origin)
-    ? origin
-    : "http://localhost:3000";
+  const origin = req.headers.get("Origin");
+  const isAllowedOrigin = !origin || ALLOWED_ORIGINS.includes(origin);
+  const resolvedOrigin =
+    origin && ALLOWED_ORIGINS.includes(origin) ? origin : "https://dhsc.uk";
 
   return {
     isAllowedOrigin,
