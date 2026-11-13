@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import { supabase } from "@/lib/supabase";
-import { isValidE164 } from "@/lib/sms-validation";
+import { isValidE164, normalizeUkPhone } from "@/lib/sms-validation";
 
 export default function PublicOptOutPage() {
   const [phoneNumber, setPhoneNumber] = useState("");
@@ -14,10 +14,10 @@ export default function PublicOptOutPage() {
     e.preventDefault();
     setErrorMessage(null);
 
-    const cleanPhone = phoneNumber.trim().replace(/[\s()-]/g, "");
+    const cleanPhone = normalizeUkPhone(phoneNumber);
     if (!isValidE164(cleanPhone)) {
       setErrorMessage(
-        "Must be a valid UK number starting with +44 (e.g., +447700900077)."
+        "Must be a valid UK number starting with +44 or 07 (e.g., +447700900077)."
       );
       return;
     }

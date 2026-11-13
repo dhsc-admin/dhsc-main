@@ -18,6 +18,24 @@ export const DEFAULT_SENDER_ID = "Dilli Haat";
 export const MIN_SCHEDULE_BUFFER_MINUTES = 15;
 export const MIN_CANCEL_BUFFER_MINUTES = 5;
 export const LONDON_TIMEZONE = "Europe/London";
+export const FORBIDDEN_ANGLE_BRACKET_REGEX = /[<>]/;
+
+export function hasForbiddenAngleBrackets(value: string): boolean {
+  return FORBIDDEN_ANGLE_BRACKET_REGEX.test(value);
+}
+
+/**
+ * Idempotently appends `" Stop: dhsc.uk/x"` if `msg.trimEnd()` does not
+ * already end with `"Stop: dhsc.uk/x"` (case-insensitive).
+ */
+export function appendOptOutSuffix(msg: string): string {
+  if (!msg || !msg.trim()) return "";
+  const trimmedEnd = msg.trimEnd();
+  if (trimmedEnd.toLowerCase().endsWith("stop: dhsc.uk/x")) {
+    return trimmedEnd;
+  }
+  return `${msg}${OPT_OUT_SUFFIX}`;
+}
 
 /**
  * Standard 3GPP TS 23.038 GSM-7 Default Alphabet (1 septet each)
@@ -99,10 +117,17 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
   const isUcs2 = nonGsmSet.size > 0;
   const encoding: SmsEncoding = isUcs2 ? "UCS-2" : "GSM-7";
 
+  const hasSuffixAlready = text
+    .trimEnd()
+    .toLowerCase()
+    .endsWith("stop: dhsc.uk/x");
+
   const rawSingleSegmentLimit = isUcs2 ? 70 : 160;
-  const adjustedSingleSegmentLimit = isUcs2
-    ? MAX_UCS2_CHARACTERS
-    : MAX_GSM7_CHARACTERS;
+  const adjustedSingleSegmentLimit = hasSuffixAlready
+    ? rawSingleSegmentLimit
+    : isUcs2
+      ? MAX_UCS2_CHARACTERS
+      : MAX_GSM7_CHARACTERS;
   const multiSegmentLimit = isUcs2 ? 67 : 153;
 
   // In UCS-2, SMS gateways count UTF-16 code units (text.length in JS),
@@ -116,13 +141,14 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
     segments = 0;
   } else if (effectiveUnitCount <= adjustedSingleSegmentLimit) {
     segments = 1;
-  } else if (effectiveUnitCount <= rawSingleSegmentLimit) {
+  } else if (!hasSuffixAlready && effectiveUnitCount <= rawSingleSegmentLimit) {
     // Exceeds user limit once the 16-character opt-out suffix is appended (2 segments total)
     segments = 2;
   } else {
-    segments = Math.ceil(
-      (effectiveUnitCount + OPT_OUT_SUFFIX_LENGTH) / multiSegmentLimit
-    );
+    const totalUnitsWithSuffix = hasSuffixAlready
+      ? effectiveUnitCount
+      : effectiveUnitCount + OPT_OUT_SUFFIX_LENGTH;
+    segments = Math.ceil(totalUnitsWithSuffix / multiSegmentLimit);
   }
 
   const maxAllowedUnitsTotal = adjustedSingleSegmentLimit;
@@ -152,10 +178,32 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
 }
 
 /**
- * Strict UK E.164 Phone Number Validation
+ * Strict UK E.164 Phone Number Validation & Normalizer
  * Must start with '+44' followed by 9 or 10 digits.
  */
 export const E164_REGEX = /^\+44\d{9,10}$/;
+
+/**
+ * Strips spaces, hyphens, and parentheses, converts a leading `0044` to `+44`,
+ * converts a leading `44` (without `+`) to `+44`, and converts a leading `0`
+ * (e.g. `07700900077`) to `+447700900077`.
+ */
+export function normalizeUkPhone(input: string): string {
+  const cleaned = String(input ?? "")
+    .trim()
+    .replace(/[\s()-]/g, "");
+  if (!cleaned) return "";
+  if (cleaned.startsWith("0044")) {
+    return `+44${cleaned.slice(4)}`;
+  }
+  if (cleaned.startsWith("44")) {
+    return `+${cleaned}`;
+  }
+  if (cleaned.startsWith("0")) {
+    return `+44${cleaned.slice(1)}`;
+  }
+  return cleaned;
+}
 
 export function isValidE164(phone: string): boolean {
   return E164_REGEX.test(phone.trim());
@@ -170,14 +218,14 @@ export interface RecipientSanitizationResult {
 }
 
 /**
- * Sanitizes, validates E.164, deduplicates, and cross-checks against opt_outs table.
+ * Sanitizes, normalizes UK format, validates E.164, deduplicates, and cross-checks against opt_outs table.
  */
 export function sanitizeRecipients(
   rawPhones: string[],
   optOutNumbers: Iterable<string>
 ): RecipientSanitizationResult {
   const optOutSet = new Set(
-    Array.from(optOutNumbers).map((n) => n.trim())
+    Array.from(optOutNumbers).map((n) => normalizeUkPhone(n))
   );
 
   const seenValid = new Set<string>();
@@ -189,13 +237,14 @@ export function sanitizeRecipients(
   let rawInputCount = 0;
 
   for (const raw of rawPhones) {
-    // Strip invisible whitespace but do NOT guess country codes (strict E.164 requirement)
-    const normalized = raw.trim().replace(/[\s()-]/g, "");
+    const trimmedRaw = raw.trim();
+    if (!trimmedRaw) continue;
+    const normalized = normalizeUkPhone(trimmedRaw);
     if (!normalized) continue;
     rawInputCount++;
 
     if (!isValidE164(normalized)) {
-      invalidFormatRejected.push(raw.trim());
+      invalidFormatRejected.push(trimmedRaw);
       continue;
     }
 
@@ -254,7 +303,9 @@ export function londonLocalToUtcDate(londonDateTimeStr: string): Date | null {
 export function londonLocalToUtcIso(londonDateTimeStr: string): string | null {
   const utcDate = londonLocalToUtcDate(londonDateTimeStr);
   if (!utcDate) return null;
-  return utcDate.toISOString().replace(/\.\d{3}Z$/, "Z");
+  const zeroed = new Date(utcDate.getTime());
+  zeroed.setUTCSeconds(0, 0);
+  return zeroed.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 export function utcToLondonDate(utcInput: Date | string | number): Date | null {
@@ -279,12 +330,18 @@ export function getFutureLondonDatetimeLocal(
   minutesAhead = 30,
   nowMs: number = Date.now()
 ): string {
-  const targetUtcDate = addMinutes(new Date(nowMs), minutesAhead);
-  return formatInTimeZone(targetUtcDate, LONDON_TIMEZONE, "yyyy-MM-dd'T'HH:mm");
+  const minTargetMs = addMinutes(new Date(nowMs), minutesAhead).getTime();
+  const fifteenMinMs = 15 * 60 * 1000;
+  const snappedMs = Math.ceil(minTargetMs / fifteenMinMs) * fifteenMinMs;
+  return formatInTimeZone(
+    new Date(snappedMs),
+    LONDON_TIMEZONE,
+    "yyyy-MM-dd'T'HH:mm"
+  );
 }
 
 /**
- * Timezone & Scheduling Guardrails (UTC enforcement)
+ * Timezone & Scheduling Guardrails (UTC enforcement & 15-minute interval check)
  */
 export function validateScheduleTimestamp(
   scheduledAtIsoUtc: string,
@@ -307,6 +364,15 @@ export function validateScheduleTimestamp(
       valid: false,
       diffMinutes,
       error: `Scheduled dispatch must be at least ${MIN_SCHEDULE_BUFFER_MINUTES} minutes in the future (currently ${Math.floor(diffMinutes)}m).`,
+    };
+  }
+
+  if (new Date(parsedMs).getUTCMinutes() % 15 !== 0) {
+    return {
+      valid: false,
+      diffMinutes,
+      error:
+        "Scheduled time must be on a 15-minute interval (:00, :15, :30, or :45).",
     };
   }
 
@@ -403,19 +469,20 @@ export const TestSmsSchema = z.object({
   recipientPhone: z
     .string()
     .trim()
-    .regex(
-      E164_REGEX,
-      "Must be a valid UK number starting with +44 (e.g., +447700900077)"
-    ),
+    .transform((val) => normalizeUkPhone(val))
+    .refine((val) => E164_REGEX.test(val), {
+      message:
+        "Must be a valid UK number starting with +44 (e.g., +447700900077)",
+    }),
   message: z
     .string()
     .min(1, "Message body cannot be empty")
-    .max(
-      MAX_GSM7_CHARACTERS,
-      `Message cannot exceed ${MAX_GSM7_CHARACTERS} characters (reserves ${OPT_OUT_SUFFIX_LENGTH} chars for opt-out suffix).`
+    .regex(
+      /^[^<>]*$/,
+      "Characters '<' and '>' are not allowed in SMS messages."
     )
     .superRefine((val, ctx) => {
-      const analysis = analyzeSmsSegments(val);
+      const analysis = analyzeSmsSegments(appendOptOutSuffix(val));
       if (analysis.isOverMaxSegments) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -440,6 +507,10 @@ export const CampaignFormSchema = z
       .trim()
       .min(3, "Sender ID is required")
       .max(15, "Sender ID must be <= 15 characters")
+      .regex(
+        /^[^<>]*$/,
+        "Characters '<' and '>' are not allowed in Sender ID."
+      )
       .default(DEFAULT_SENDER_ID),
     audienceId: z.string().min(1, "Please select a recipient audience or custom list"),
     customRecipientsRaw: z
@@ -449,7 +520,7 @@ export const CampaignFormSchema = z
         (val) => {
           if (!val || !val.trim()) return true;
           const phones = parsePhoneListString(val);
-          return phones.every((p) => E164_REGEX.test(p.replace(/[\s()-]/g, "")));
+          return phones.every((p) => E164_REGEX.test(normalizeUkPhone(p)));
         },
         {
           message:
@@ -459,12 +530,12 @@ export const CampaignFormSchema = z
     message: z
       .string()
       .min(1, "SMS message body is required")
-      .max(
-        MAX_GSM7_CHARACTERS,
-        `SMS message cannot exceed ${MAX_GSM7_CHARACTERS} characters (reserves ${OPT_OUT_SUFFIX_LENGTH} chars for opt-out suffix).`
+      .regex(
+        /^[^<>]*$/,
+        "Characters '<' and '>' are not allowed in SMS messages."
       )
       .superRefine((val, ctx) => {
-        const analysis = analyzeSmsSegments(val);
+        const analysis = analyzeSmsSegments(appendOptOutSuffix(val));
         if (analysis.isOverMaxSegments) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,

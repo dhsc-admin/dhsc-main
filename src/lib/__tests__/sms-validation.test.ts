@@ -12,16 +12,19 @@ vi.hoisted(() => {
 
 import {
   analyzeSmsSegments,
+  appendOptOutSuffix,
   CampaignFormSchema,
   canCancelScheduledCampaign,
   DEFAULT_SENDER_ID,
   evaluateCreditGate,
+  hasForbiddenAngleBrackets,
   isValidE164,
   londonLocalToUtcDate,
   londonLocalToUtcIso,
   MAX_ALLOWED_CHARACTERS,
   MAX_ALLOWED_SEGMENTS,
   MAX_UCS2_CHARACTERS,
+  normalizeUkPhone,
   OPT_OUT_SUFFIX,
   sanitizeRecipients,
   utcToLondonDate,
@@ -41,8 +44,14 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     vi.restoreAllMocks();
   });
 
-  it("1. Enforces strict UK (+44) E.164 validation, deduplication, and opt-out stripping", () => {
+  it("1. Enforces strict UK (+44) E.164 validation, UK phone normalization (07.../0044.../44...), deduplication, and opt-out stripping", () => {
+    expect(normalizeUkPhone("07700 900 077")).toBe("+447700900077");
+    expect(normalizeUkPhone("00447700900077")).toBe("+447700900077");
+    expect(normalizeUkPhone("447700900077")).toBe("+447700900077");
+    expect(normalizeUkPhone("+447700900077")).toBe("+447700900077");
+
     expect(isValidE164("+447700900077")).toBe(true);
+    expect(isValidE164(normalizeUkPhone("07700 900 077"))).toBe(true);
     expect(isValidE164("+442079460991")).toBe(true);
     expect(isValidE164("+14155552671")).toBe(false);
     expect(isValidE164("+919810012345")).toBe(false);
@@ -51,12 +60,12 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
 
     const raw = [
       "+447700900077",
-      "+447700900077", // duplicate
-      "+447700900099", // opted-out
+      "07700 900 077", // normalized duplicate of +447700900077
+      "07700900099", // normalized opted-out (+447700900099)
       "+919810012345", // non-UK rejected
       "+14155552671", // non-UK rejected
       "07700-INVALID", // invalid E.164
-      "+447700900078",
+      "00447700900078", // normalized valid (+447700900078)
     ];
     const optOuts = ["+447700900099"];
 
@@ -71,7 +80,7 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     ]);
   });
 
-  it("2. Accurately calculates GSM-7 (including extended chars like €) vs UCS-2 and enforces 144 GSM-7 / 54 UCS-2 / 1-segment limit", () => {
+  it("2. Accurately calculates GSM-7 vs UCS-2 with idempotent opt-out suffix and disallows '<' and '>'", () => {
     expect(OPT_OUT_SUFFIX).toBe(" Stop: dhsc.uk/x");
     expect(OPT_OUT_SUFFIX.length).toBe(16);
     expect(MAX_ALLOWED_CHARACTERS).toBe(144);
@@ -79,39 +88,72 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     expect(MAX_ALLOWED_SEGMENTS).toBe(1);
     expect(DEFAULT_SENDER_ID).toBe("Dilli Haat");
 
+    // Idempotent opt-out suffix helper
+    expect(appendOptOutSuffix("Hello")).toBe("Hello Stop: dhsc.uk/x");
+    expect(appendOptOutSuffix("Hello Stop: dhsc.uk/x")).toBe(
+      "Hello Stop: dhsc.uk/x"
+    );
+    expect(appendOptOutSuffix("Hello stop: dhsc.uk/x  ")).toBe(
+      "Hello stop: dhsc.uk/x"
+    );
+
     const singleGsm = calculateMessageDetails("Hello Dilli Haat €10 voucher");
     expect(singleGsm.encoding).toBe("GSM-7");
-    // "Hello Dilli Haat €10 voucher" is 28 chars, but '€' is 2 septets -> 29 effective units
-    expect(singleGsm.charCount).toBe(28);
-    expect(singleGsm.effectiveUnits).toBe(29);
-    expect(singleGsm.perSegmentLimit).toBe(144);
-    expect(singleGsm.remainingInSegment).toBe(144 - 29);
+    // "Hello Dilli Haat €10 voucher" (28 chars, 29 septets) + " Stop: dhsc.uk/x" (16 chars) = 44 chars, 45 septets
+    expect(singleGsm.charCount).toBe(44);
+    expect(singleGsm.effectiveUnits).toBe(45);
+    expect(singleGsm.perSegmentLimit).toBe(160);
+    expect(singleGsm.remainingInSegment).toBe(160 - 45);
     expect(singleGsm.segmentCount).toBe(1);
     expect(singleGsm.isOverLimit).toBe(false);
 
+    // Pre-appended suffix is not double-counted
+    const alreadySuffixed = calculateMessageDetails(
+      "Hello Dilli Haat €10 voucher Stop: dhsc.uk/x"
+    );
+    expect(alreadySuffixed.charCount).toBe(44);
+    expect(alreadySuffixed.remainingInSegment).toBe(160 - 45);
+    expect(alreadySuffixed.segmentCount).toBe(1);
+
     const exact144Gsm = calculateMessageDetails("A".repeat(144));
-    expect(exact144Gsm.charCount).toBe(144);
+    expect(exact144Gsm.charCount).toBe(160);
     expect(exact144Gsm.remainingInSegment).toBe(0);
     expect(exact144Gsm.segmentCount).toBe(1);
     expect(exact144Gsm.isOverLimit).toBe(false);
 
     const over144Gsm = calculateMessageDetails("A".repeat(145));
-    expect(over144Gsm.charCount).toBe(145);
+    expect(over144Gsm.charCount).toBe(161);
     expect(over144Gsm.isOverLimit).toBe(true);
 
     const backtickUcs2 = calculateMessageDetails("Backtick ` forces UCS-2");
     expect(backtickUcs2.encoding).toBe("UCS-2 (Unicode)");
-    expect(backtickUcs2.perSegmentLimit).toBe(54);
+    expect(backtickUcs2.perSegmentLimit).toBe(70);
 
     const exact54Ucs2 = calculateMessageDetails("`" + "A".repeat(53));
-    expect(exact54Ucs2.charCount).toBe(54);
+    expect(exact54Ucs2.charCount).toBe(70);
     expect(exact54Ucs2.remainingInSegment).toBe(0);
     expect(exact54Ucs2.segmentCount).toBe(1);
     expect(exact54Ucs2.isOverLimit).toBe(false);
 
     const over54Ucs2 = calculateMessageDetails("`" + "A".repeat(54));
-    expect(over54Ucs2.charCount).toBe(55);
+    expect(over54Ucs2.charCount).toBe(71);
     expect(over54Ucs2.isOverLimit).toBe(true);
+
+    // Disallow '<' and '>' characters (Sendmode pattern: [^<>]*)
+    expect(hasForbiddenAngleBrackets("Discount <50%>")).toBe(true);
+    const angleMsg = calculateMessageDetails("Offer <VIP>");
+    expect(angleMsg.hasForbiddenChars).toBe(true);
+    expect(angleMsg.isOverLimit).toBe(true);
+
+    expect(() =>
+      CampaignFormSchema.parse({
+        name: "Bad Brackets",
+        audienceId: "all",
+        message: "Hello <world>",
+        dispatchType: "immediate",
+        idempotencyKey: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+      })
+    ).toThrow(/not allowed/i);
 
     const multiGsm = analyzeSmsSegments("A".repeat(161));
     expect(multiGsm.encoding).toBe("GSM-7");
@@ -149,17 +191,22 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     expect(rejected.canAffordCampaign).toBe(false);
   });
 
-  it("4. Enforces 15-minute future scheduling buffer, 5-minute cancellation lock, and Europe/London <-> UTC conversion", () => {
-    const now = Date.now();
-    const tenMinAhead = new Date(now + 10 * 60 * 1000).toISOString();
-    const twentyMinAhead = new Date(now + 20 * 60 * 1000).toISOString();
+  it("4. Enforces 15-minute future scheduling buffer, 15-minute UTC slot interval (:00/:15/:30/:45), 5-minute cancellation lock, and Europe/London <-> UTC conversion", () => {
+    const now = Date.parse("2026-07-15T12:00:00Z");
+    const tenMinAhead = new Date(now + 10 * 60 * 1000).toISOString(); // 12:10:00Z (<15m)
+    const twentyMinUnaligned = new Date(now + 20 * 60 * 1000).toISOString(); // 12:20:00Z (not :00/:15/:30/:45)
+    const thirtyMinAligned = new Date(now + 30 * 60 * 1000).toISOString(); // 12:30:00Z (valid)
 
     expect(validateScheduleTimestamp(tenMinAhead, now).valid).toBe(false);
-    expect(validateScheduleTimestamp(twentyMinAhead, now).valid).toBe(true);
+    expect(validateScheduleTimestamp(twentyMinUnaligned, now).valid).toBe(false);
+    expect(validateScheduleTimestamp(twentyMinUnaligned, now).error).toBe(
+      "Scheduled time must be on a 15-minute interval (:00, :15, :30, or :45)."
+    );
+    expect(validateScheduleTimestamp(thirtyMinAligned, now).valid).toBe(true);
 
     const threeMinAhead = new Date(now + 3 * 60 * 1000).toISOString();
     expect(canCancelScheduledCampaign(threeMinAhead, now).allowed).toBe(false);
-    expect(canCancelScheduledCampaign(twentyMinAhead, now).allowed).toBe(true);
+    expect(canCancelScheduledCampaign(thirtyMinAligned, now).allowed).toBe(true);
 
     // British Summer Time (BST = UTC+1): 14:30 in London -> 13:30 UTC
     const bstUtcIso = londonLocalToUtcIso("2026-07-15T14:30");
@@ -179,9 +226,11 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
       "2026-11-15T14:30"
     );
 
-    // Default scheduler input helper generates Europe/London local string
-    const bstBaseMs = Date.parse("2026-07-15T13:00:00Z"); // 14:00 BST
-    expect(getFutureDatetimeLocal(30, bstBaseMs)).toBe("2026-07-15T14:30");
+    // Default scheduler input helper snaps forward to the next 15-minute boundary >= 30m ahead in Europe/London
+    const bstUnalignedBaseMs = Date.parse("2026-07-15T13:04:00Z"); // 14:04 BST -> +30m = 14:34 BST -> snaps to 14:45 BST
+    expect(getFutureDatetimeLocal(30, bstUnalignedBaseMs)).toBe(
+      "2026-07-15T14:45"
+    );
 
     // UI formatDate forces Europe/London display
     expect(formatDate("2026-07-15T13:30:00Z", true)).toContain("14:30");

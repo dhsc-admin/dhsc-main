@@ -5,11 +5,13 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase } from "../lib/supabase";
 import {
   analyzeSmsSegments,
+  appendOptOutSuffix,
   canCancelScheduledCampaign,
   DEFAULT_SENDER_ID,
   E164_REGEX,
   evaluateCreditGate,
   getFutureLondonDatetimeLocal,
+  hasForbiddenAngleBrackets,
   isValidE164,
   LONDON_TIMEZONE,
   londonLocalToUtcIso,
@@ -18,6 +20,7 @@ import {
   MAX_UCS2_CHARACTERS,
   MIN_CANCEL_BUFFER_MINUTES,
   MIN_SCHEDULE_BUFFER_MINUTES,
+  normalizeUkPhone,
   OPT_OUT_SUFFIX,
   OPT_OUT_SUFFIX_LENGTH,
   validateScheduleTimestamp,
@@ -121,7 +124,9 @@ export interface CampaignItem {
 
 // --- Utilities ---
 export const calculateMessageDetails = (text: string) => {
-  const analysis = analyzeSmsSegments(text);
+  const appendedText = appendOptOutSuffix(text);
+  const analysis = analyzeSmsSegments(appendedText);
+  const hasForbiddenChars = hasForbiddenAngleBrackets(text);
   return {
     encoding: analysis.encoding === "UCS-2" ? "UCS-2 (Unicode)" : "GSM-7",
     charCount: analysis.rawCharacterCount,
@@ -129,7 +134,8 @@ export const calculateMessageDetails = (text: string) => {
     segmentCount: analysis.segments,
     perSegmentLimit: analysis.maxUnitsPerSegment,
     remainingInSegment: analysis.remainingInCurrentSegment,
-    isOverLimit: analysis.isOverMaxSegments,
+    isOverLimit: analysis.isOverMaxSegments || hasForbiddenChars,
+    hasForbiddenChars,
     nonGsmCharacters: analysis.nonGsmCharacters,
   };
 };
@@ -419,7 +425,8 @@ export const ApiServices = {
 
   // 6. Optout Number (Syncs number to sms-rest 3.0 blacklist + Supabase opt_outs)
   optoutNumber: async (phoneNumber: string): Promise<{ success: boolean }> => {
-    if (!isValidE164(phoneNumber)) {
+    const normalizedPhone = normalizeUkPhone(phoneNumber);
+    if (!isValidE164(normalizedPhone)) {
       throw new Error(
         "Phone number must be a valid UK number starting with +44 (e.g., +447700900077)."
       );
@@ -427,7 +434,7 @@ export const ApiServices = {
     const { data, error } = await supabase.functions.invoke("sms-proxy", {
       body: {
         action: "optout_number",
-        phoneNumber,
+        phoneNumber: normalizedPhone,
       },
     });
     if (error) {
@@ -977,7 +984,7 @@ export default function BulkSMSManager({
   };
 
   const handleSendTestSms = async () => {
-    const cleanPhone = testPhone.trim().replace(/[\s()-]/g, "");
+    const cleanPhone = normalizeUkPhone(testPhone);
     if (!isValidE164(cleanPhone)) {
       showToast(
         "Must be a valid UK number starting with +44 (e.g., +447700900077).",
@@ -988,6 +995,13 @@ export default function BulkSMSManager({
     if (optOuts.includes(cleanPhone)) {
       showToast(
         `Blocked: ${cleanPhone} is on the Opt-Out blacklist and cannot receive SMS.`,
+        "error"
+      );
+      return;
+    }
+    if (msgDetails.hasForbiddenChars) {
+      showToast(
+        "Characters '<' and '>' are not allowed by the SMS gateway.",
         "error"
       );
       return;
@@ -1054,7 +1068,7 @@ export default function BulkSMSManager({
 
   const handleAddOptOut = async (e: React.FormEvent) => {
     e.preventDefault();
-    const clean = newOptOutPhone.trim().replace(/[\s()-]/g, "");
+    const clean = normalizeUkPhone(newOptOutPhone);
     if (!isValidE164(clean)) {
       showToast(
         "Must be a valid UK number starting with +44 (e.g., +447700900077)",
@@ -1486,11 +1500,7 @@ export default function BulkSMSManager({
                   </span>
                 </div>
                 <textarea
-                  maxLength={
-                    msgDetails.encoding === "UCS-2 (Unicode)"
-                      ? MAX_UCS2_CHARACTERS
-                      : MAX_GSM7_CHARACTERS
-                  }
+                  maxLength={160}
                   className={`w-full px-3 py-3 sm:py-2 border rounded-lg focus:ring-2 outline-none transition-all resize-none h-32 text-base sm:text-sm ${msgDetails.isOverLimit
                     ? "border-red-400 focus:ring-red-500 focus:border-red-500 bg-red-50/20"
                     : "border-slate-300 focus:ring-blue-500 focus:border-blue-500"
@@ -1508,15 +1518,31 @@ export default function BulkSMSManager({
                     } else if (nextVal.length < message.length) {
                       setMessage(nextVal);
                     } else {
-                      // Truncate to the exact allowed limit for the detected encoding
-                      const limit = nextDetails.perSegmentLimit;
+                      // Truncate to the exact allowed user limit for the detected encoding
+                      const hasOwnSuffix = nextVal
+                        .trimEnd()
+                        .toLowerCase()
+                        .endsWith("stop: dhsc.uk/x");
+                      const limit = hasOwnSuffix
+                        ? nextDetails.perSegmentLimit
+                        : Math.max(
+                            0,
+                            nextDetails.perSegmentLimit - OPT_OUT_SUFFIX_LENGTH
+                          );
                       const truncated = Array.from(nextVal).slice(0, limit).join("");
                       setMessage(truncated);
                     }
                   }}
                 />
 
-                {msgDetails.isOverLimit && (
+                {msgDetails.hasForbiddenChars && (
+                  <p className="mt-1.5 text-xs text-red-600 font-medium flex items-center gap-1">
+                    <Icons.AlertTriangle className="w-4 h-4 shrink-0" />
+                    Characters &apos;&lt;&apos; and &apos;&gt;&apos; are not allowed by the SMS gateway.
+                  </p>
+                )}
+
+                {msgDetails.isOverLimit && !msgDetails.hasForbiddenChars && (
                   <p className="mt-1.5 text-xs text-red-600 font-medium flex items-center gap-1">
                     <Icons.AlertTriangle className="w-4 h-4 shrink-0" />
                     Message exceeds the maximum limit of {msgDetails.perSegmentLimit} characters / {MAX_ALLOWED_SEGMENTS} segment (with {OPT_OUT_SUFFIX_LENGTH}-char opt-out suffix). Please shorten the message.
@@ -2057,11 +2083,12 @@ export default function BulkSMSManager({
                   className="w-full px-3 py-3 sm:py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-base sm:text-sm font-mono"
                   placeholder="+447700900077"
                 />
-                {!E164_REGEX.test(testPhone.trim()) && testPhone.trim().length > 0 && (
-                  <p className="text-xs text-red-600 mt-1">
-                    Must be a valid UK number starting with +44 (e.g., +447700900077).
-                  </p>
-                )}
+                {!E164_REGEX.test(normalizeUkPhone(testPhone)) &&
+                  testPhone.trim().length > 0 && (
+                    <p className="text-xs text-red-600 mt-1">
+                      Must be a valid UK number starting with +44 or 07 (e.g., +447700900077).
+                    </p>
+                  )}
               </div>
 
               <div className="flex items-center gap-4 text-sm">

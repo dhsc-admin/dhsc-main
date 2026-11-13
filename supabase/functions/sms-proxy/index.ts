@@ -35,10 +35,47 @@ const ALLOWED_ORIGINS = [
 ];
 
 const E164_REGEX = /^\+44\d{9,10}$/;
+const FORBIDDEN_ANGLE_BRACKET_REGEX = /[<>]/;
 const OPT_OUT_SUFFIX = " Stop: dhsc.uk/x";
 const MAX_ALLOWED_SEGMENTS = 1;
 const DEFAULT_SENDER_ID = "Dilli Haat";
 const SENDMODE_BATCH_LIMIT = 100;
+const SUPABASE_PAGE_SIZE = 1000;
+
+/**
+ * Strips spaces, hyphens, and parentheses, converts a leading `0044` to `+44`,
+ * converts a leading `44` (without `+`) to `+44`, and converts a leading `0`
+ * (e.g. `07700900077`) to `+447700900077`.
+ */
+function normalizeUkPhone(input: string): string {
+  const cleaned = String(input ?? "")
+    .trim()
+    .replace(/[\s()-]/g, "");
+  if (!cleaned) return "";
+  if (cleaned.startsWith("0044")) {
+    return `+44${cleaned.slice(4)}`;
+  }
+  if (cleaned.startsWith("44")) {
+    return `+${cleaned}`;
+  }
+  if (cleaned.startsWith("0")) {
+    return `+44${cleaned.slice(1)}`;
+  }
+  return cleaned;
+}
+
+/**
+ * Idempotently appends `" Stop: dhsc.uk/x"` if `msg.trimEnd()` does not
+ * already end with `"Stop: dhsc.uk/x"` (case-insensitive).
+ */
+function appendOptOutSuffix(msg: string): string {
+  if (!msg || !msg.trim()) return "";
+  const trimmedEnd = msg.trimEnd();
+  if (trimmedEnd.toLowerCase().endsWith("stop: dhsc.uk/x")) {
+    return trimmedEnd;
+  }
+  return `${msg}${OPT_OUT_SUFFIX}`;
+}
 
 /**
  * Standard 3GPP TS 23.038 GSM-7 Default Alphabet (1 septet each)
@@ -166,9 +203,9 @@ function chunkPhoneNumbers(
 }
 
 /**
- * Parses an incoming `scheduledAt` timestamp strictly as UTC and returns
- * the epoch milliseconds alongside the normalized `YYYY-MM-DDThh:mm:ssZ`
- * UTC ISO 8601 string required by Sendmode (`schedule_date`).
+ * Parses an incoming `scheduledAt` timestamp strictly as UTC, zeroes seconds
+ * and milliseconds, and returns the epoch milliseconds alongside the normalized
+ * `YYYY-MM-DDTHH:mm:00Z` UTC ISO 8601 string required by Sendmode (`schedule_date`).
  */
 function parseUtcScheduleIso(
   rawScheduledAt: unknown
@@ -179,8 +216,51 @@ function parseUtcScheduleIso(
   const utcCandidate = hasExplicitZone ? str : `${str}Z`;
   const parsedMs = Date.parse(utcCandidate);
   if (Number.isNaN(parsedMs)) return null;
-  const isoUtc = new Date(parsedMs).toISOString().replace(/\.\d{3}Z$/, "Z");
-  return { parsedMs, isoUtc };
+  const zeroed = new Date(parsedMs);
+  zeroed.setUTCSeconds(0, 0);
+  const isoUtc = zeroed.toISOString().replace(/\.\d{3}Z$/, "Z");
+  return { parsedMs: zeroed.getTime(), isoUtc };
+}
+
+/**
+ * Paginated Supabase table reader using `.range(offset, offset + 999)`
+ * so tables exceeding 1,000 rows (`contacts`, `opt_outs`) are never truncated.
+ */
+async function fetchAllRows<T>(
+  supabaseAdmin: SupabaseClient,
+  table: string,
+  columns: string,
+  orderBy?: { column: string; ascending: boolean }
+): Promise<T[]> {
+  const allRows: T[] = [];
+  let offset = 0;
+
+  while (true) {
+    let query = supabaseAdmin.from(table).select(columns);
+    if (orderBy && typeof query.order === "function") {
+      query = query.order(orderBy.column, { ascending: orderBy.ascending });
+    }
+    if (typeof query.range === "function") {
+      const { data, error } = await query.range(
+        offset,
+        offset + SUPABASE_PAGE_SIZE - 1
+      );
+      if (error) throw error;
+      const page = (data ?? []) as T[];
+      allRows.push(...page);
+      if (page.length < SUPABASE_PAGE_SIZE) {
+        break;
+      }
+      offset += SUPABASE_PAGE_SIZE;
+    } else {
+      const { data, error } = await query;
+      if (error) throw error;
+      allRows.push(...((data ?? []) as T[]));
+      break;
+    }
+  }
+
+  return allRows;
 }
 
 /**
@@ -261,13 +341,13 @@ async function computeCreditLedger(
     },
   });
 
-  if (!balanceRes.ok) {
+  const balanceJson = await balanceRes.json().catch(() => ({}));
+  if (!balanceRes.ok || balanceJson?.is_successful === false) {
     throw new Error(
-      `Failed to fetch credit balance from Sendmode (HTTP ${balanceRes.status}).`
+      balanceJson?.error_message || "Sendmode API request failed"
     );
   }
 
-  const balanceJson = await balanceRes.json();
   const parsedBalance = parseInt(String(balanceJson?.balance ?? 0), 10);
   const liveBalance = Number.isNaN(parsedBalance) ? 0 : parsedBalance;
 
@@ -310,19 +390,15 @@ async function resolveAudienceRecipients(
   audienceId: string,
   body: Record<string, unknown>
 ): Promise<{ data?: ResolvedAudienceResult; clientError?: string }> {
-  const { data: optOutRows, error: optOutErr } = await supabaseAdmin
-    .from("opt_outs")
-    .select("phone");
-
-  if (optOutErr) throw optOutErr;
+  const optOutRows = await fetchAllRows<OptOutRow>(
+    supabaseAdmin,
+    "opt_outs",
+    "phone"
+  );
 
   const optOutSet = new Set<string>(
-    ((optOutRows ?? []) as OptOutRow[])
-      .map((r: OptOutRow) =>
-        String(r.phone ?? "")
-          .trim()
-          .replace(/[\s()-]/g, "")
-      )
+    optOutRows
+      .map((r: OptOutRow) => normalizeUkPhone(String(r.phone ?? "")))
       .filter(Boolean)
   );
 
@@ -342,9 +418,7 @@ async function resolveAudienceRecipients(
     }
 
     for (const raw of body.customPhones) {
-      const normalized = String(raw ?? "")
-        .trim()
-        .replace(/[\s()-]/g, "");
+      const normalized = normalizeUkPhone(String(raw ?? ""));
       if (!normalized) continue;
       rawRecipientCount++;
 
@@ -371,18 +445,16 @@ async function resolveAudienceRecipients(
     audienceId === "random" ||
     audienceId === "top"
   ) {
-    const contactsQuery = supabaseAdmin
-      .from("contacts")
-      .select("phone_e164, visit_count");
+    const contactRows = await fetchAllRows<ContactRow>(
+      supabaseAdmin,
+      "contacts",
+      "phone_e164, visit_count",
+      audienceId === "top"
+        ? { column: "visit_count", ascending: false }
+        : undefined
+    );
 
-    const { data: contactRows, error: contactsErr } =
-      audienceId === "top" && typeof contactsQuery.order === "function"
-        ? await contactsQuery.order("visit_count", { ascending: false })
-        : await contactsQuery;
-
-    if (contactsErr) throw contactsErr;
-
-    const rows: ContactRow[] = [...((contactRows ?? []) as ContactRow[])];
+    const rows: ContactRow[] = [...contactRows];
     if (audienceId === "top") {
       rows.sort(
         (a: ContactRow, b: ContactRow) =>
@@ -391,9 +463,7 @@ async function resolveAudienceRecipients(
     }
 
     for (const row of rows) {
-      const normalized = String(row.phone_e164 ?? "")
-        .trim()
-        .replace(/[\s()-]/g, "");
+      const normalized = normalizeUkPhone(String(row.phone_e164 ?? ""));
       if (!normalized) continue;
       rawRecipientCount++;
 
@@ -493,9 +563,28 @@ serve(async (req: Request): Promise<Response> => {
     // Bypasses JWT verification so recipients can unsubscribe via dhsc.uk/x
     // =========================================================================
     if (action === "public_optout") {
-      const cleanPhone = String(body.phoneNumber ?? "")
-        .trim()
-        .replace(/[\s()-]/g, "");
+      const oneMinuteAgoIso = new Date(Date.now() - 60000).toISOString();
+      const { count: recentPublicOptOuts, error: rateErr } = await supabaseAdmin
+        .from("opt_outs")
+        .select("*", { count: "exact", head: true })
+        .eq("source", "public_link")
+        .gt("created_at", oneMinuteAgoIso);
+
+      if (rateErr) throw rateErr;
+
+      if ((recentPublicOptOuts ?? 0) >= 10) {
+        return new Response(
+          JSON.stringify({
+            error: "429 Too Many Requests: Rate limit exceeded for public opt-out.",
+          }),
+          {
+            status: 429,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const cleanPhone = normalizeUkPhone(String(body.phoneNumber ?? ""));
 
       if (!E164_REGEX.test(cleanPhone)) {
         return new Response(
@@ -524,28 +613,27 @@ serve(async (req: Request): Promise<Response> => {
 
       if (upsertErr) throw upsertErr;
 
-      const providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/optouts`, {
-        method: "POST",
-        headers: {
-          Authorization: `${Deno.env.get("SMS_API")}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          mobile_number: cleanPhone,
-          phone: cleanPhone,
-        }),
-      });
-
-      if (!providerRes.ok) {
-        return new Response(
-          JSON.stringify({
-            error: "Failed to sync opt-out number with Sendmode.",
+      try {
+        const providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/optouts`, {
+          method: "POST",
+          headers: {
+            Authorization: `${Deno.env.get("SMS_API")}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            mobile_number: cleanPhone,
+            phone: cleanPhone,
           }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
+        });
+        const providerData = await providerRes.json().catch(() => ({}));
+        if (!providerRes.ok || providerData?.is_successful === false) {
+          console.error(
+            "Sendmode public opt-out sync warning:",
+            providerData?.error_message || `HTTP ${providerRes.status}`
+          );
+        }
+      } catch (syncErr) {
+        console.error("Sendmode public opt-out sync error:", syncErr);
       }
 
       return new Response(JSON.stringify({ success: true }), {
@@ -634,7 +722,20 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const cleanPhone = String(phoneNumber ?? "").trim();
+      if (FORBIDDEN_ANGLE_BRACKET_REGEX.test(trimmedSenderId)) {
+        return new Response(
+          JSON.stringify({
+            error:
+              "400 Bad Request: Characters '<' and '>' are not allowed in sender_id.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const cleanPhone = normalizeUkPhone(String(phoneNumber ?? ""));
       if (!E164_REGEX.test(cleanPhone)) {
         return new Response(
           JSON.stringify({
@@ -659,8 +760,21 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Server-Side Auto-Append of opt-out suffix BEFORE segment analysis
-      const resolvedMessage = `${rawMessage}${OPT_OUT_SUFFIX}`;
+      if (FORBIDDEN_ANGLE_BRACKET_REGEX.test(rawMessage)) {
+        return new Response(
+          JSON.stringify({
+            error:
+              "400 Bad Request: Characters '<' and '>' are not allowed in message.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // Server-Side Idempotent Auto-Append of opt-out suffix BEFORE segment analysis
+      const resolvedMessage = appendOptOutSuffix(rawMessage);
       const segmentAnalysis = analyzeSmsSegments(resolvedMessage);
       const actualSegments = segmentAnalysis.segments;
       const calculatedCost = actualSegments;
@@ -742,6 +856,18 @@ serve(async (req: Request): Promise<Response> => {
             JSON.stringify({
               error:
                 "SCHEDULE_BUFFER_VIOLATION: Scheduled SMS must be at least 15 minutes in the future (UTC).",
+            }),
+            {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+        if (new Date(parsedUtc.parsedMs).getUTCMinutes() % 15 !== 0) {
+          return new Response(
+            JSON.stringify({
+              error:
+                "Scheduled time must be on a 15-minute interval (:00, :15, :30, or :45).",
             }),
             {
               status: 400,
@@ -842,17 +968,20 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      if (!providerRes.ok) {
+      const providerData = await providerRes.json().catch(() => ({}));
+      if (!providerRes.ok || providerData?.is_successful === false) {
+        const providerErrorMsg =
+          providerData?.error_message || "Sendmode API request failed";
         await supabaseAdmin
           .from("sms_campaigns")
           .update({
             status: "failed",
-            failure_reason: `Sendmode /3.0/send returned HTTP ${providerRes.status}.`,
+            failure_reason: providerErrorMsg,
           })
           .eq("id", processingRow.id);
 
         return new Response(
-          JSON.stringify({ error: "Sendmode failed to dispatch single SMS." }),
+          JSON.stringify({ error: providerErrorMsg }),
           {
             status: 502,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -860,7 +989,6 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const providerData = await providerRes.json();
       const requestId = String(providerData?.request_id ?? "");
       const newBalance = Math.max(0, ledger.liveBalance - calculatedCost);
 
@@ -940,8 +1068,24 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // 1. Server-Side Auto-Append & Segment Analysis (Zero-Trust)
-      const messageText = `${rawMessage}${OPT_OUT_SUFFIX}`;
+      if (
+        FORBIDDEN_ANGLE_BRACKET_REGEX.test(trimmedSenderId) ||
+        FORBIDDEN_ANGLE_BRACKET_REGEX.test(rawMessage)
+      ) {
+        return new Response(
+          JSON.stringify({
+            error:
+              "400 Bad Request: Characters '<' and '>' are not allowed in message or sender_id.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // 1. Server-Side Idempotent Auto-Append & Segment Analysis (Zero-Trust)
+      const messageText = appendOptOutSuffix(rawMessage);
       const segmentAnalysis = analyzeSmsSegments(messageText);
       const actualSegments = segmentAnalysis.segments;
 
@@ -1089,13 +1233,13 @@ serve(async (req: Request): Promise<Response> => {
               }
             );
 
-            if (!providerRes.ok) {
+            const providerData = await providerRes.json().catch(() => ({}));
+            if (!providerRes.ok || providerData?.is_successful === false) {
               throw new Error(
-                `Sendmode /3.0/send/bulk returned HTTP ${providerRes.status}.`
+                providerData?.error_message || "Sendmode API request failed"
               );
             }
 
-            const providerData = await providerRes.json();
             return String(providerData?.request_id ?? "").trim();
           })
         );
@@ -1106,7 +1250,7 @@ serve(async (req: Request): Promise<Response> => {
         const failureReason =
           providerErr instanceof Error
             ? providerErr.message
-            : "Sendmode bulk SMS dispatch failed.";
+            : "Sendmode API request failed";
 
         await supabaseAdmin
           .from("sms_campaigns")
@@ -1117,7 +1261,7 @@ serve(async (req: Request): Promise<Response> => {
           .eq("id", processingCampaign.id);
 
         return new Response(
-          JSON.stringify({ error: "Sendmode bulk SMS dispatch failed." }),
+          JSON.stringify({ error: failureReason }),
           {
             status: 502,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -1216,8 +1360,24 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // 1. Server-Side Auto-Append & Segment Analysis (Zero-Trust)
-      const messageText = `${rawMessage}${OPT_OUT_SUFFIX}`;
+      if (
+        FORBIDDEN_ANGLE_BRACKET_REGEX.test(trimmedSenderId) ||
+        FORBIDDEN_ANGLE_BRACKET_REGEX.test(rawMessage)
+      ) {
+        return new Response(
+          JSON.stringify({
+            error:
+              "400 Bad Request: Characters '<' and '>' are not allowed in message or sender_id.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // 1. Server-Side Idempotent Auto-Append & Segment Analysis (Zero-Trust)
+      const messageText = appendOptOutSuffix(rawMessage);
       const segmentAnalysis = analyzeSmsSegments(messageText);
       const actualSegments = segmentAnalysis.segments;
 
@@ -1255,7 +1415,20 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Format `schedule_date` strictly as an ISO 8601 string in UTC (`YYYY-MM-DDThh:mm:ssZ`)
+      if (new Date(parsedUtcSchedule.parsedMs).getUTCMinutes() % 15 !== 0) {
+        return new Response(
+          JSON.stringify({
+            error:
+              "Scheduled time must be on a 15-minute interval (:00, :15, :30, or :45).",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // Format `schedule_date` strictly as an ISO 8601 string in UTC (`YYYY-MM-DDTHH:mm:00Z`)
       const scheduleDateIsoUtc = parsedUtcSchedule.isoUtc;
 
       // 2. Fetch Recipients Server-Side (Zero-Trust; ignores frontend `recipientsCount`)
@@ -1387,13 +1560,13 @@ serve(async (req: Request): Promise<Response> => {
               }
             );
 
-            if (!providerRes.ok) {
+            const providerData = await providerRes.json().catch(() => ({}));
+            if (!providerRes.ok || providerData?.is_successful === false) {
               throw new Error(
-                `Sendmode /3.0/schedule/bulk returned HTTP ${providerRes.status}.`
+                providerData?.error_message || "Sendmode API request failed"
               );
             }
 
-            const providerData = await providerRes.json();
             return String(providerData?.request_id ?? "").trim();
           })
         );
@@ -1404,7 +1577,7 @@ serve(async (req: Request): Promise<Response> => {
         const failureReason =
           providerErr instanceof Error
             ? providerErr.message
-            : "Sendmode bulk campaign scheduling failed.";
+            : "Sendmode API request failed";
 
         await supabaseAdmin
           .from("sms_campaigns")
@@ -1416,7 +1589,7 @@ serve(async (req: Request): Promise<Response> => {
 
         return new Response(
           JSON.stringify({
-            error: "Sendmode campaign scheduling failed.",
+            error: failureReason,
           }),
           {
             status: 502,
@@ -1518,19 +1691,23 @@ serve(async (req: Request): Promise<Response> => {
                 body: JSON.stringify({ request_id: reqId }),
               });
 
-              if (!delRes.ok) {
+              const providerData = await delRes.json().catch(() => ({}));
+              if (!delRes.ok || providerData?.is_successful === false) {
                 throw new Error(
-                  `Sendmode DELETE /3.0/schedule failed with HTTP ${delRes.status}.`
+                  providerData?.error_message || "Sendmode API request failed"
                 );
               }
             })
           );
         } catch (delErr) {
           console.error(delErr);
+          const delErrMsg =
+            delErr instanceof Error
+              ? delErr.message
+              : "Sendmode API request failed";
           return new Response(
             JSON.stringify({
-              error:
-                "Sendmode Schedule Delete failed; Supabase status left unchanged.",
+              error: delErrMsg,
             }),
             {
               status: 502,
@@ -1565,7 +1742,7 @@ serve(async (req: Request): Promise<Response> => {
     // =========================================================================
     if (action === "optout_number") {
       const { phoneNumber } = body;
-      const cleanPhone = String(phoneNumber ?? "").trim();
+      const cleanPhone = normalizeUkPhone(String(phoneNumber ?? ""));
 
       if (!E164_REGEX.test(cleanPhone)) {
         return new Response(
@@ -1606,10 +1783,11 @@ serve(async (req: Request): Promise<Response> => {
         }),
       });
 
-      if (!providerRes.ok) {
+      const providerData = await providerRes.json().catch(() => ({}));
+      if (!providerRes.ok || providerData?.is_successful === false) {
         return new Response(
           JSON.stringify({
-            error: "Failed to sync opt-out number with Sendmode.",
+            error: providerData?.error_message || "Sendmode API request failed",
           }),
           {
             status: 502,
