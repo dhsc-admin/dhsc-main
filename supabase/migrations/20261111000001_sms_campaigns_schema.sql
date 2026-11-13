@@ -70,9 +70,11 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- Guardrail 4a: New scheduled campaigns must be at least 15 minutes in the future (UTC)
+    -- Guardrail 4a: New scheduled campaigns must be at least ~15 minutes in the future (UTC).
+    -- The Edge Function enforces the strict 15-minute rule; the DB uses 14 minutes to absorb
+    -- network latency between Edge validation and INSERT.
     IF TG_OP = 'INSERT' AND NEW.dispatch_type = 'scheduled' THEN
-        IF NEW.scheduled_at < (now() + INTERVAL '15 minutes') THEN
+        IF NEW.scheduled_at < (now() + INTERVAL '14 minutes') THEN
             RAISE EXCEPTION 'SCHEDULE_BUFFER_VIOLATION: Scheduled campaign must be at least 15 minutes in the future (UTC).';
         END IF;
     END IF;

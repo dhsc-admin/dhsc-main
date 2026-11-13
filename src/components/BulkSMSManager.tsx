@@ -209,7 +209,7 @@ export const ApiServices = {
         rawBalance !== null &&
         !Number.isNaN(Number(rawBalance))
         ? Number(rawBalance)
-        : 15000;
+        : 0;
     const reservedCredits = Number(data?.reservedCredits ?? 0);
     const effectiveAvailableCredits = Number(
       data?.effectiveAvailableCredits ?? liveBalance - reservedCredits
@@ -287,6 +287,9 @@ export const ApiServices = {
     campaignId?: string;
     batchId: string;
     newBalance?: number;
+    recipientsCount?: number;
+    totalCost?: number;
+    partialFailure?: string | null;
   }> => {
     const { data, error } = await supabase.functions.invoke("sms-proxy", {
       body: {
@@ -330,6 +333,13 @@ export const ApiServices = {
           : typeof data?.liveBalance === "number"
             ? data.liveBalance
             : undefined,
+      recipientsCount:
+        typeof data?.recipientsCount === "number"
+          ? data.recipientsCount
+          : undefined,
+      totalCost:
+        typeof data?.totalCost === "number" ? data.totalCost : undefined,
+      partialFailure: data?.partialFailure ?? null,
     };
   },
 
@@ -358,6 +368,8 @@ export const ApiServices = {
     success: boolean;
     campaignId?: string;
     providerCampaignId: string;
+    recipientsCount?: number;
+    totalCost?: number;
   }> => {
     const { data, error } = await supabase.functions.invoke("sms-proxy", {
       body: {
@@ -396,6 +408,12 @@ export const ApiServices = {
         data?.providerCampaignId ??
         data?.campaign?.provider_campaign_id ??
         `sched-${Date.now()}`,
+      recipientsCount:
+        typeof data?.recipientsCount === "number"
+          ? data.recipientsCount
+          : undefined,
+      totalCost:
+        typeof data?.totalCost === "number" ? data.totalCost : undefined,
     };
   },
 
@@ -666,10 +684,8 @@ export default function BulkSMSManager({
         if (balanceRes.status === "fulfilled") {
           setLiveBalance(balanceRes.value.liveBalance);
         } else {
-          const sentCost = loadedCampaigns
-            .filter((c) => c.status === "sent")
-            .reduce((sum, c) => sum + c.totalCost, 0);
-          setLiveBalance(Math.max(0, 15000 - sentCost));
+          setLiveBalance(0);
+          showToast("Unable to sync live credit balance from provider.", "error");
         }
       } finally {
         if (!isCancelled) {
@@ -683,7 +699,7 @@ export default function BulkSMSManager({
     return () => {
       isCancelled = true;
     };
-  }, [activeSession?.access_token]);
+  }, [activeSession?.access_token, showToast]);
 
   // --- Derived State: Credits & Queue Health ---
   const reservedCredits = useMemo(() => {
@@ -836,6 +852,9 @@ export default function BulkSMSManager({
 
       let providerRef = "";
       let campaignId = generateUUID();
+      let confirmedRecipients = recipientCount;
+      let confirmedCost = estimatedCost;
+      let partialFailure: string | null = null;
       const parsedSubsetSize =
         audienceType === "random" || audienceType === "top"
           ? parseInt(audienceSize, 10) || recipientCount
@@ -866,6 +885,8 @@ export default function BulkSMSManager({
         if (apiResult.campaignId) {
           campaignId = apiResult.campaignId;
         }
+        confirmedRecipients = apiResult.recipientsCount ?? recipientCount;
+        confirmedCost = apiResult.totalCost ?? confirmedRecipients * msgDetails.segmentCount;
       } else {
         const apiResult = await ApiServices.sendBulkSMS({
           idempotencyKey,
@@ -890,10 +911,13 @@ export default function BulkSMSManager({
         if (apiResult.campaignId) {
           campaignId = apiResult.campaignId;
         }
+        confirmedRecipients = apiResult.recipientsCount ?? recipientCount;
+        confirmedCost = apiResult.totalCost ?? confirmedRecipients * msgDetails.segmentCount;
+        partialFailure = apiResult.partialFailure ?? null;
         if (typeof apiResult.newBalance === "number") {
           setLiveBalance(apiResult.newBalance);
         } else {
-          setLiveBalance((prev) => Math.max(0, prev - estimatedCost));
+          setLiveBalance((prev) => Math.max(0, prev - confirmedCost));
         }
       }
 
@@ -902,21 +926,24 @@ export default function BulkSMSManager({
         idempotencyKey,
         name: name.trim(),
         status: isScheduled ? "scheduled" : "sent",
-        recipientsCount: recipientCount,
+        recipientsCount: confirmedRecipients,
         optedOutStripped: audienceSanitization.optedOutCount,
         duplicatesRemoved: audienceSanitization.duplicateCount,
         segmentCount: msgDetails.segmentCount,
         encoding: msgDetails.encoding,
-        totalCost: estimatedCost,
-        message,
+        totalCost: confirmedCost,
+        message: appendOptOutSuffix(message),
         scheduledAt: scheduledIsoUtc,
         providerCampaignId: providerRef,
       };
 
       setCampaigns((prev) => [newCampaign, ...prev]);
+      if (partialFailure) {
+        showToast(partialFailure, "error");
+      }
       showToast(
         `Campaign "${newCampaign.name}" ${isScheduled ? "scheduled" : "sent"
-        } successfully! (${estimatedCost.toLocaleString()} credits)`
+        } successfully! (${confirmedCost.toLocaleString()} credits)`
       );
 
       // Reset Form & Rotate Idempotency Key
@@ -1207,7 +1234,7 @@ export default function BulkSMSManager({
                 autoComplete="email"
                 value={loginEmail}
                 onChange={(e) => setLoginEmail(e.target.value)}
-                placeholder="operator@dillihaat.gov.in"
+                placeholder="admin@dhsc.uk"
                 className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
               />
             </div>

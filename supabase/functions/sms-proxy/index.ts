@@ -353,7 +353,8 @@ async function computeCreditLedger(
 
   const { data: campaignRows, error: dbErr } = await supabaseAdmin
     .from("sms_campaigns")
-    .select("status, estimated_credits");
+    .select("status, estimated_credits")
+    .in("status", ["scheduled", "processing"]);
 
   if (dbErr) throw dbErr;
 
@@ -934,21 +935,35 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      // Call Sendmode `POST /3.0/send`
+      // Immediate: `POST /3.0/send`. Scheduled: `POST /3.0/schedule/bulk` (single recipient).
       let providerRes: Response;
       try {
-        providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/send`, {
-          method: "POST",
-          headers: {
-            Authorization: `${Deno.env.get("SMS_API")}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            sender_id: trimmedSenderId,
-            message: resolvedMessage,
-            mobile_number: cleanPhone,
-          }),
-        });
+        providerRes = singleScheduleIsoUtc
+          ? await fetch(`${SENDMODE_BASE_URL}/3.0/schedule/bulk`, {
+              method: "POST",
+              headers: {
+                Authorization: `${Deno.env.get("SMS_API")}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                sender_id: trimmedSenderId,
+                message: resolvedMessage,
+                mobile_numbers: [cleanPhone],
+                schedule_date: singleScheduleIsoUtc,
+              }),
+            })
+          : await fetch(`${SENDMODE_BASE_URL}/3.0/send`, {
+              method: "POST",
+              headers: {
+                Authorization: `${Deno.env.get("SMS_API")}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                sender_id: trimmedSenderId,
+                message: resolvedMessage,
+                mobile_number: cleanPhone,
+              }),
+            });
       } catch (networkErr) {
         console.error(networkErr);
         await supabaseAdmin
@@ -990,14 +1005,16 @@ serve(async (req: Request): Promise<Response> => {
       }
 
       const requestId = String(providerData?.request_id ?? "");
-      const newBalance = Math.max(0, ledger.liveBalance - calculatedCost);
+      const newBalance = singleScheduleIsoUtc
+        ? ledger.liveBalance
+        : Math.max(0, ledger.liveBalance - calculatedCost);
 
       const { error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
         .update({
-          status: scheduledAt ? "scheduled" : "sent",
+          status: singleScheduleIsoUtc ? "scheduled" : "sent",
           provider_campaign_id: requestId,
-          dispatched_at: scheduledAt ? null : new Date().toISOString(),
+          dispatched_at: singleScheduleIsoUtc ? null : new Date().toISOString(),
         })
         .eq("id", processingRow.id);
 
@@ -1156,8 +1173,7 @@ serve(async (req: Request): Promise<Response> => {
       if (ledger.liveBalance - ledger.reservedCredits < calculatedCost) {
         return new Response(
           JSON.stringify({
-            error: `Insufficient effective credits: need ${calculatedCost}, have ${ledger.liveBalance - ledger.reservedCredits
-              }.`,
+            error: `Insufficient effective credits: need ${calculatedCost}, have ${ledger.liveBalance - ledger.reservedCredits}.`,
           }),
           {
             status: 402,
@@ -1207,51 +1223,63 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      // 6. Chunk `validPhoneArray` into batches of 100 and dispatch via `Promise.all`
+      // 6. Chunk `validPhoneArray` into batches of 100 and dispatch via `Promise.allSettled`
       const phoneBatches = chunkPhoneNumbers(
         validPhoneArray,
         SENDMODE_BATCH_LIMIT
       );
-      let joinedRequestIds = "";
 
-      try {
-        const batchRequestIds = await Promise.all(
-          phoneBatches.map(async (batch) => {
-            const providerRes = await fetch(
-              `${SENDMODE_BASE_URL}/3.0/send/bulk`,
-              {
-                method: "POST",
-                headers: {
-                  Authorization: `${Deno.env.get("SMS_API")}`,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  sender_id: trimmedSenderId,
-                  message: messageText,
-                  mobile_numbers: batch,
-                }),
-              }
-            );
-
-            const providerData = await providerRes.json().catch(() => ({}));
-            if (!providerRes.ok || providerData?.is_successful === false) {
-              throw new Error(
-                providerData?.error_message || "Sendmode API request failed"
-              );
+      const sendResults = await Promise.allSettled(
+        phoneBatches.map(async (batch) => {
+          const providerRes = await fetch(
+            `${SENDMODE_BASE_URL}/3.0/send/bulk`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `${Deno.env.get("SMS_API")}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                sender_id: trimmedSenderId,
+                message: messageText,
+                mobile_numbers: batch,
+              }),
             }
+          );
 
-            return String(providerData?.request_id ?? "").trim();
-          })
-        );
+          const providerData = await providerRes.json().catch(() => ({}));
+          if (!providerRes.ok || providerData?.is_successful === false) {
+            throw new Error(
+              providerData?.error_message || "Sendmode API request failed"
+            );
+          }
 
-        joinedRequestIds = batchRequestIds.filter(Boolean).join(",");
-      } catch (providerErr) {
-        console.error(providerErr);
-        const failureReason =
-          providerErr instanceof Error
-            ? providerErr.message
-            : "Sendmode API request failed";
+          return String(providerData?.request_id ?? "").trim();
+        })
+      );
 
+      const succeededRequestIds: string[] = [];
+      let sentRecipientCount = 0;
+      const batchErrors: string[] = [];
+      sendResults.forEach((result, idx) => {
+        if (result.status === "fulfilled") {
+          if (result.value) succeededRequestIds.push(result.value);
+          sentRecipientCount += phoneBatches[idx].length;
+        } else {
+          const reason =
+            result.reason instanceof Error
+              ? result.reason.message
+              : "Sendmode API request failed";
+          batchErrors.push(reason);
+          console.error(`Batch ${idx + 1} failed:`, reason);
+        }
+      });
+
+      const joinedRequestIds = succeededRequestIds.join(",");
+      const failedBatchCount = batchErrors.length;
+
+      if (failedBatchCount === phoneBatches.length) {
+        const failureReason = batchErrors[0] || "Sendmode API request failed";
         await supabaseAdmin
           .from("sms_campaigns")
           .update({
@@ -1269,6 +1297,11 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
+      const partialFailureReason =
+        failedBatchCount > 0
+          ? `Partial failure: ${failedBatchCount} of ${phoneBatches.length} batches failed (${validCount - sentRecipientCount} recipients not sent). First error: ${batchErrors[0]}`
+          : null;
+
       // 7. Post-dispatch Update (`status = 'sent'`, `provider_campaign_id = joinedRequestIds`)
       const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
@@ -1276,6 +1309,7 @@ serve(async (req: Request): Promise<Response> => {
           status: "sent",
           provider_campaign_id: joinedRequestIds,
           dispatched_at: new Date().toISOString(),
+          failure_reason: partialFailureReason,
         })
         .eq("id", processingCampaign.id)
         .select()
@@ -1283,16 +1317,19 @@ serve(async (req: Request): Promise<Response> => {
 
       if (updateErr) throw updateErr;
 
-      const newBalance = Math.max(0, ledger.liveBalance - calculatedCost);
+      const sentCost = actualSegments * sentRecipientCount;
+      const newBalance = Math.max(0, ledger.liveBalance - sentCost);
 
       return new Response(
         JSON.stringify({
           success: true,
           request_id: joinedRequestIds,
           batchId: joinedRequestIds,
-          recipientsCount: validCount,
+          recipientsCount: sentRecipientCount,
+          failedBatchCount,
+          partialFailure: partialFailureReason,
           segmentCount: actualSegments,
-          totalCost: calculatedCost,
+          totalCost: sentCost,
           newBalance,
           campaign: finalizedCampaign,
         }),
@@ -1481,8 +1518,7 @@ serve(async (req: Request): Promise<Response> => {
       if (ledger.liveBalance - ledger.reservedCredits < calculatedCost) {
         return new Response(
           JSON.stringify({
-            error: `Insufficient effective credits: need ${calculatedCost}, have ${ledger.liveBalance - ledger.reservedCredits
-              }.`,
+            error: `Insufficient effective credits: need ${calculatedCost}, have ${ledger.liveBalance - ledger.reservedCredits}.`,
           }),
           {
             status: 402,
@@ -1533,57 +1569,96 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      // 6. Chunk `validPhoneArray` into batches of 100 and schedule via `Promise.all`
+      // 6. Chunk `validPhoneArray` into batches of 100 and schedule via `Promise.allSettled`
       const phoneBatches = chunkPhoneNumbers(
         validPhoneArray,
         SENDMODE_BATCH_LIMIT
       );
-      let joinedRequestIds = "";
 
-      try {
-        const batchRequestIds = await Promise.all(
-          phoneBatches.map(async (batch) => {
-            const providerRes = await fetch(
-              `${SENDMODE_BASE_URL}/3.0/schedule/bulk`,
-              {
-                method: "POST",
-                headers: {
-                  Authorization: `${Deno.env.get("SMS_API")}`,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  sender_id: trimmedSenderId,
-                  message: messageText,
-                  mobile_numbers: batch,
-                  schedule_date: scheduleDateIsoUtc,
-                }),
-              }
+      const scheduleResults = await Promise.allSettled(
+        phoneBatches.map(async (batch) => {
+          const providerRes = await fetch(
+            `${SENDMODE_BASE_URL}/3.0/schedule/bulk`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `${Deno.env.get("SMS_API")}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                sender_id: trimmedSenderId,
+                message: messageText,
+                mobile_numbers: batch,
+                schedule_date: scheduleDateIsoUtc,
+              }),
+            }
+          );
+
+          const providerData = await providerRes.json().catch(() => ({}));
+          if (!providerRes.ok || providerData?.is_successful === false) {
+            throw new Error(
+              providerData?.error_message || "Sendmode API request failed"
             );
+          }
 
-            const providerData = await providerRes.json().catch(() => ({}));
-            if (!providerRes.ok || providerData?.is_successful === false) {
+          return String(providerData?.request_id ?? "").trim();
+        })
+      );
+
+      const scheduledRequestIds: string[] = [];
+      const scheduleErrors: string[] = [];
+      for (const result of scheduleResults) {
+        if (result.status === "fulfilled") {
+          if (result.value) scheduledRequestIds.push(result.value);
+        } else {
+          scheduleErrors.push(
+            result.reason instanceof Error
+              ? result.reason.message
+              : "Sendmode API request failed"
+          );
+        }
+      }
+
+      if (scheduleErrors.length > 0) {
+        console.error("Scheduled batch failures:", scheduleErrors);
+
+        // Roll back every batch that DID schedule so no orphaned sends fire later
+        const rollbackResults = await Promise.allSettled(
+          scheduledRequestIds.map(async (reqId) => {
+            const delRes = await fetch(`${SENDMODE_BASE_URL}/3.0/schedule`, {
+              method: "DELETE",
+              headers: {
+                Authorization: `${Deno.env.get("SMS_API")}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ request_id: reqId }),
+            });
+            const delData = await delRes.json().catch(() => ({}));
+            if (!delRes.ok || delData?.is_successful === false) {
               throw new Error(
-                providerData?.error_message || "Sendmode API request failed"
+                delData?.error_message || `Rollback failed for ${reqId}`
               );
             }
-
-            return String(providerData?.request_id ?? "").trim();
+            return reqId;
           })
         );
 
-        joinedRequestIds = batchRequestIds.filter(Boolean).join(",");
-      } catch (providerErr) {
-        console.error(providerErr);
+        const orphanedIds = rollbackResults
+          .map((r, i) => (r.status === "rejected" ? scheduledRequestIds[i] : null))
+          .filter((id): id is string => Boolean(id));
+
         const failureReason =
-          providerErr instanceof Error
-            ? providerErr.message
-            : "Sendmode API request failed";
+          `${scheduleErrors.length} of ${phoneBatches.length} batches failed to schedule (${scheduleErrors[0]}). ` +
+          (orphanedIds.length > 0
+            ? `ROLLBACK INCOMPLETE — manually cancel Sendmode request_ids: ${orphanedIds.join(",")}`
+            : `Rolled back ${scheduledRequestIds.length} successfully scheduled batches.`);
 
         await supabaseAdmin
           .from("sms_campaigns")
           .update({
             status: "failed",
             failure_reason: failureReason,
+            provider_campaign_id: orphanedIds.length > 0 ? orphanedIds.join(",") : null,
           })
           .eq("id", processingCampaign.id);
 
@@ -1597,6 +1672,8 @@ serve(async (req: Request): Promise<Response> => {
           }
         );
       }
+
+      const joinedRequestIds = scheduledRequestIds.join(",");
 
       // 7. Post-dispatch Update (`status = 'scheduled'`, `provider_campaign_id = joinedRequestIds`)
       const { data: finalizedCampaign, error: updateErr } = await supabaseAdmin
@@ -1771,34 +1848,46 @@ serve(async (req: Request): Promise<Response> => {
 
       if (upsertErr) throw upsertErr;
 
-      const providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/optouts`, {
-        method: "POST",
-        headers: {
-          Authorization: `${Deno.env.get("SMS_API")}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          mobile_number: cleanPhone,
-          phone: cleanPhone,
-        }),
-      });
-
-      const providerData = await providerRes.json().catch(() => ({}));
-      if (!providerRes.ok || providerData?.is_successful === false) {
-        return new Response(
-          JSON.stringify({
-            error: providerData?.error_message || "Sendmode API request failed",
+      // Local opt-out is already committed; provider sync failure must never block it.
+      let providerSynced = true;
+      try {
+        const providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/optouts`, {
+          method: "POST",
+          headers: {
+            Authorization: `${Deno.env.get("SMS_API")}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            mobile_number: cleanPhone,
+            phone: cleanPhone,
           }),
-          {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
+        });
+
+        const providerData = await providerRes.json().catch(() => ({}));
+        if (!providerRes.ok || providerData?.is_successful === false) {
+          providerSynced = false;
+          console.error(
+            "Sendmode opt-out sync warning:",
+            providerData?.error_message || `HTTP ${providerRes.status}`
+          );
+        }
+      } catch (syncErr) {
+        providerSynced = false;
+        console.error("Sendmode opt-out sync error:", syncErr);
+      }
+
+      if (!providerSynced) {
+        const { error: flagErr } = await supabaseAdmin
+          .from("opt_outs")
+          .update({ provider_synced: false })
+          .eq("phone", cleanPhone);
+        if (flagErr) console.error("Failed to flag provider_synced=false:", flagErr);
       }
 
       return new Response(
-        JSON.stringify({ success: true, phone: cleanPhone }),
+        JSON.stringify({ success: true, phone: cleanPhone, providerSynced }),
         {
+          status: 200,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         }
       );
