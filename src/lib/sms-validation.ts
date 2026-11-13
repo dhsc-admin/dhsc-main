@@ -2,8 +2,15 @@ import { z } from "zod";
 
 /**
  * NON-NEGOTIABLE GUARDRAIL CONSTANTS
+ * The server automatically appends `" Stop: dhsc.uk/x"` (16 chars) to every SMS.
+ * Standard 1-segment limits (160 GSM-7 / 70 UCS-2) are reduced by 16 characters
+ * on the frontend: 144 characters for GSM-7 and 54 characters for UCS-2.
  */
-export const MAX_ALLOWED_CHARACTERS = 150;
+export const OPT_OUT_SUFFIX = " Stop: dhsc.uk/x";
+export const OPT_OUT_SUFFIX_LENGTH = 16;
+export const MAX_GSM7_CHARACTERS = 160 - OPT_OUT_SUFFIX_LENGTH; // 144
+export const MAX_UCS2_CHARACTERS = 70 - OPT_OUT_SUFFIX_LENGTH; // 54
+export const MAX_ALLOWED_CHARACTERS = MAX_GSM7_CHARACTERS; // 144
 export const MAX_ALLOWED_SEGMENTS = 1;
 export const DEFAULT_SENDER_ID = "Dilli Haat";
 export const MIN_SCHEDULE_BUFFER_MINUTES = 15;
@@ -57,11 +64,11 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
       rawCharacterCount: 0,
       effectiveUnitCount: 0,
       segments: 0,
-      maxUnitsPerSegment: MAX_ALLOWED_CHARACTERS,
-      singleSegmentLimit: 160,
+      maxUnitsPerSegment: MAX_GSM7_CHARACTERS,
+      singleSegmentLimit: MAX_GSM7_CHARACTERS,
       multiSegmentLimit: 153,
-      remainingInCurrentSegment: MAX_ALLOWED_CHARACTERS,
-      maxAllowedUnitsTotal: MAX_ALLOWED_CHARACTERS,
+      remainingInCurrentSegment: MAX_GSM7_CHARACTERS,
+      maxAllowedUnitsTotal: MAX_GSM7_CHARACTERS,
       isOverMaxSegments: false,
       nonGsmCharacters: [],
       extendedGsmCharacters: [],
@@ -89,7 +96,10 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
   const isUcs2 = nonGsmSet.size > 0;
   const encoding: SmsEncoding = isUcs2 ? "UCS-2" : "GSM-7";
 
-  const singleSegmentLimit = isUcs2 ? 70 : 160;
+  const rawSingleSegmentLimit = isUcs2 ? 70 : 160;
+  const adjustedSingleSegmentLimit = isUcs2
+    ? MAX_UCS2_CHARACTERS
+    : MAX_GSM7_CHARACTERS;
   const multiSegmentLimit = isUcs2 ? 67 : 153;
 
   // In UCS-2, SMS gateways count UTF-16 code units (text.length in JS),
@@ -97,30 +107,30 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
   const effectiveUnitCount = isUcs2 ? text.length : gsmSeptets;
 
   let segments = 0;
-  let maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
+  const maxUnitsPerSegment = adjustedSingleSegmentLimit;
 
   if (effectiveUnitCount === 0) {
     segments = 0;
-  } else if (effectiveUnitCount <= singleSegmentLimit) {
+  } else if (effectiveUnitCount <= adjustedSingleSegmentLimit) {
     segments = 1;
-    maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
+  } else if (effectiveUnitCount <= rawSingleSegmentLimit) {
+    // Exceeds user limit once the 16-character opt-out suffix is appended (2 segments total)
+    segments = 2;
   } else {
-    segments = Math.ceil(effectiveUnitCount / multiSegmentLimit);
-    maxUnitsPerSegment = multiSegmentLimit;
+    segments = Math.ceil(
+      (effectiveUnitCount + OPT_OUT_SUFFIX_LENGTH) / multiSegmentLimit
+    );
   }
 
-  const maxAllowedUnitsTotal =
-    MAX_ALLOWED_SEGMENTS === 1
-      ? Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS)
-      : Math.min(multiSegmentLimit * MAX_ALLOWED_SEGMENTS, MAX_ALLOWED_CHARACTERS);
+  const maxAllowedUnitsTotal = adjustedSingleSegmentLimit;
   const remainingInCurrentSegment = Math.max(
     0,
-    maxAllowedUnitsTotal - effectiveUnitCount
+    adjustedSingleSegmentLimit - effectiveUnitCount
   );
   const isOverMaxSegments =
     segments > MAX_ALLOWED_SEGMENTS ||
-    codePoints.length > MAX_ALLOWED_CHARACTERS ||
-    effectiveUnitCount > MAX_ALLOWED_CHARACTERS;
+    effectiveUnitCount > adjustedSingleSegmentLimit ||
+    codePoints.length > adjustedSingleSegmentLimit;
 
   return {
     encoding,
@@ -128,7 +138,7 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
     effectiveUnitCount,
     segments,
     maxUnitsPerSegment,
-    singleSegmentLimit,
+    singleSegmentLimit: adjustedSingleSegmentLimit,
     multiSegmentLimit,
     remainingInCurrentSegment,
     maxAllowedUnitsTotal,
@@ -346,21 +356,15 @@ export const TestSmsSchema = z.object({
     .string()
     .min(1, "Message body cannot be empty")
     .max(
-      MAX_ALLOWED_CHARACTERS,
-      `Message cannot exceed ${MAX_ALLOWED_CHARACTERS} characters.`
+      MAX_GSM7_CHARACTERS,
+      `Message cannot exceed ${MAX_GSM7_CHARACTERS} characters (reserves ${OPT_OUT_SUFFIX_LENGTH} chars for opt-out suffix).`
     )
     .superRefine((val, ctx) => {
       const analysis = analyzeSmsSegments(val);
-      if (analysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Message is ${analysis.rawCharacterCount} characters, exceeding the hard maximum of ${MAX_ALLOWED_CHARACTERS} characters.`,
-        });
-      }
       if (analysis.isOverMaxSegments) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `Message uses ${analysis.segments} segments (${analysis.encoding}), exceeding the maximum limit of ${MAX_ALLOWED_SEGMENTS} segment (${MAX_ALLOWED_CHARACTERS} characters max).`,
+          message: `Message exceeds 1 segment with opt-out suffix (max ${analysis.maxAllowedUnitsTotal} ${analysis.encoding} characters).`,
         });
       }
     }),
@@ -388,21 +392,15 @@ export const CampaignFormSchema = z
       .string()
       .min(1, "SMS message body is required")
       .max(
-        MAX_ALLOWED_CHARACTERS,
-        `SMS message cannot exceed ${MAX_ALLOWED_CHARACTERS} characters.`
+        MAX_GSM7_CHARACTERS,
+        `SMS message cannot exceed ${MAX_GSM7_CHARACTERS} characters (reserves ${OPT_OUT_SUFFIX_LENGTH} chars for opt-out suffix).`
       )
       .superRefine((val, ctx) => {
         const analysis = analyzeSmsSegments(val);
-        if (analysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `Message is ${analysis.rawCharacterCount} characters, exceeding the hard maximum of ${MAX_ALLOWED_CHARACTERS} characters.`,
-          });
-        }
         if (analysis.isOverMaxSegments) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `Message requires ${analysis.segments} segments (${analysis.encoding}). Hard ceiling is ${MAX_ALLOWED_SEGMENTS} segment (${MAX_ALLOWED_CHARACTERS} characters max).`,
+            message: `Message exceeds 1 segment with opt-out suffix (max ${analysis.maxAllowedUnitsTotal} ${analysis.encoding} characters).`,
           });
         }
       }),

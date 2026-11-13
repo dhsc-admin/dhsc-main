@@ -10,10 +10,13 @@ import {
   E164_REGEX,
   evaluateCreditGate,
   isValidE164,
-  MAX_ALLOWED_CHARACTERS,
   MAX_ALLOWED_SEGMENTS,
+  MAX_GSM7_CHARACTERS,
+  MAX_UCS2_CHARACTERS,
   MIN_CANCEL_BUFFER_MINUTES,
   MIN_SCHEDULE_BUFFER_MINUTES,
+  OPT_OUT_SUFFIX,
+  OPT_OUT_SUFFIX_LENGTH,
   validateScheduleTimestamp,
 } from "../lib/sms-validation";
 
@@ -1475,23 +1478,44 @@ export default function BulkSMSManager({
                     Message Body
                   </label>
                   <span className="text-xs text-slate-500">
-                    Max {MAX_ALLOWED_CHARACTERS} chars ({MAX_ALLOWED_SEGMENTS} segment)
+                    Max {msgDetails.perSegmentLimit} chars ({MAX_ALLOWED_SEGMENTS} segment, −{OPT_OUT_SUFFIX_LENGTH} for &quot;{OPT_OUT_SUFFIX.trim()}&quot;)
                   </span>
                 </div>
                 <textarea
+                  maxLength={
+                    msgDetails.encoding === "UCS-2 (Unicode)"
+                      ? MAX_UCS2_CHARACTERS
+                      : MAX_GSM7_CHARACTERS
+                  }
                   className={`w-full px-3 py-3 sm:py-2 border rounded-lg focus:ring-2 outline-none transition-all resize-none h-32 text-base sm:text-sm ${msgDetails.isOverLimit
                     ? "border-red-400 focus:ring-red-500 focus:border-red-500 bg-red-50/20"
                     : "border-slate-300 focus:ring-blue-500 focus:border-blue-500"
                     }`}
                   placeholder="Type your message here..."
                   value={message}
-                  onChange={(e) => setMessage(e.target.value)}
+                  onChange={(e) => {
+                    const nextVal = e.target.value;
+                    const nextDetails = calculateMessageDetails(nextVal);
+                    if (
+                      nextDetails.effectiveUnits <= nextDetails.perSegmentLimit &&
+                      nextDetails.charCount <= nextDetails.perSegmentLimit
+                    ) {
+                      setMessage(nextVal);
+                    } else if (nextVal.length < message.length) {
+                      setMessage(nextVal);
+                    } else {
+                      // Truncate to the exact allowed limit for the detected encoding
+                      const limit = nextDetails.perSegmentLimit;
+                      const truncated = Array.from(nextVal).slice(0, limit).join("");
+                      setMessage(truncated);
+                    }
+                  }}
                 />
 
                 {msgDetails.isOverLimit && (
                   <p className="mt-1.5 text-xs text-red-600 font-medium flex items-center gap-1">
                     <Icons.AlertTriangle className="w-4 h-4 shrink-0" />
-                    Message exceeds the maximum limit of {MAX_ALLOWED_CHARACTERS} characters / {MAX_ALLOWED_SEGMENTS} segment ({msgDetails.charCount} chars, {msgDetails.segmentCount} segments). Please shorten the message.
+                    Message exceeds the maximum limit of {msgDetails.perSegmentLimit} characters / {MAX_ALLOWED_SEGMENTS} segment (with {OPT_OUT_SUFFIX_LENGTH}-char opt-out suffix). Please shorten the message.
                   </p>
                 )}
 
@@ -1511,7 +1535,7 @@ export default function BulkSMSManager({
                   <div className="flex justify-between">
                     <span className="text-slate-500">Characters:</span>
                     <span className="font-medium">
-                      {msgDetails.charCount}{" "}
+                      {msgDetails.charCount} / {msgDetails.perSegmentLimit}{" "}
                       <span className="text-xs text-slate-400">
                         ({msgDetails.remainingInSegment} left)
                       </span>

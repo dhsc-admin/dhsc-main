@@ -35,7 +35,7 @@ const ALLOWED_ORIGINS = [
 ];
 
 const E164_REGEX = /^\+[1-9]\d{6,14}$/;
-const MAX_ALLOWED_CHARACTERS = 150;
+const OPT_OUT_SUFFIX = " Stop: dhsc.uk/x";
 const MAX_ALLOWED_SEGMENTS = 1;
 const DEFAULT_SENDER_ID = "Dilli Haat";
 const SENDMODE_BATCH_LIMIT = 100;
@@ -76,7 +76,8 @@ interface SegmentAnalysis {
 
 /**
  * Server-side SMS segment analyzer (3GPP TS 23.038 GSM-7 vs UCS-2).
- * Enforces MAX_ALLOWED_CHARACTERS = 150 and MAX_ALLOWED_SEGMENTS = 1.
+ * Evaluates the full message AFTER `" Stop: dhsc.uk/x"` has been appended.
+ * Enforces MAX_ALLOWED_SEGMENTS = 1 (<=160 septets for GSM-7, <=70 units for UCS-2).
  */
 function analyzeSmsSegments(text: string): SegmentAnalysis {
   if (!text || text.length === 0) {
@@ -85,11 +86,11 @@ function analyzeSmsSegments(text: string): SegmentAnalysis {
       rawCharacterCount: 0,
       effectiveUnitCount: 0,
       segments: 0,
-      maxUnitsPerSegment: MAX_ALLOWED_CHARACTERS,
+      maxUnitsPerSegment: 160,
       singleSegmentLimit: 160,
       multiSegmentLimit: 153,
-      remainingInCurrentSegment: MAX_ALLOWED_CHARACTERS,
-      maxAllowedUnitsTotal: MAX_ALLOWED_CHARACTERS,
+      remainingInCurrentSegment: 160,
+      maxAllowedUnitsTotal: 160,
       isOverMaxSegments: false,
     };
   }
@@ -115,33 +116,26 @@ function analyzeSmsSegments(text: string): SegmentAnalysis {
   const effectiveUnitCount = isUcs2 ? text.length : gsmSeptets;
 
   let segments = 0;
-  let maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
+  let maxUnitsPerSegment = singleSegmentLimit;
 
   if (effectiveUnitCount === 0) {
     segments = 0;
   } else if (effectiveUnitCount <= singleSegmentLimit) {
     segments = 1;
-    maxUnitsPerSegment = Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS);
+    maxUnitsPerSegment = singleSegmentLimit;
   } else {
     segments = Math.ceil(effectiveUnitCount / multiSegmentLimit);
     maxUnitsPerSegment = multiSegmentLimit;
   }
 
-  const maxAllowedUnitsTotal =
-    MAX_ALLOWED_SEGMENTS === 1
-      ? Math.min(singleSegmentLimit, MAX_ALLOWED_CHARACTERS)
-      : Math.min(
-        multiSegmentLimit * MAX_ALLOWED_SEGMENTS,
-        MAX_ALLOWED_CHARACTERS
-      );
+  const maxAllowedUnitsTotal = singleSegmentLimit;
   const remainingInCurrentSegment = Math.max(
     0,
     maxAllowedUnitsTotal - effectiveUnitCount
   );
   const isOverMaxSegments =
     segments > MAX_ALLOWED_SEGMENTS ||
-    codePoints.length > MAX_ALLOWED_CHARACTERS ||
-    effectiveUnitCount > MAX_ALLOWED_CHARACTERS;
+    effectiveUnitCount > singleSegmentLimit;
 
   return {
     encoding,
@@ -473,6 +467,73 @@ serve(async (req: Request): Promise<Response> => {
 
   try {
     const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    const body = await req.json();
+    const { action } = body;
+
+    // =========================================================================
+    // 0. Unauthenticated Public Opt-Out Endpoint (`public_optout`)
+    // Bypasses JWT verification so recipients can unsubscribe via dhsc.uk/x
+    // =========================================================================
+    if (action === "public_optout") {
+      const cleanPhone = String(body.phoneNumber ?? "")
+        .trim()
+        .replace(/[\s()-]/g, "");
+
+      if (!E164_REGEX.test(cleanPhone)) {
+        return new Response(
+          JSON.stringify({
+            error: "400 Bad Request: Invalid E.164 phone number format.",
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const { error: upsertErr } = await supabaseAdmin
+        .from("opt_outs")
+        .upsert(
+          {
+            phone: cleanPhone,
+            reason: "User opted out via public link",
+            source: "public_link",
+            provider_synced: true,
+          },
+          { onConflict: "phone" }
+        );
+
+      if (upsertErr) throw upsertErr;
+
+      const providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/optouts`, {
+        method: "POST",
+        headers: {
+          Authorization: `${Deno.env.get("SMS_API")}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          mobile_number: cleanPhone,
+          phone: cleanPhone,
+        }),
+      });
+
+      if (!providerRes.ok) {
+        return new Response(
+          JSON.stringify({
+            error: "Failed to sync opt-out number with Sendmode.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     // =========================================================================
     // 1. Cryptographic JWT Verification (Zero-Trust Identity Check)
@@ -509,8 +570,6 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     const authenticatedUser = authData.user;
-    const body = await req.json();
-    const { action } = body;
 
     // =========================================================================
     // A. Check Credit Balance (`GET /3.0/balance`)
@@ -567,21 +626,32 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const resolvedMessage = String(messageBody ?? message ?? "");
+      const rawMessage = String(messageBody ?? message ?? "");
+      if (!rawMessage.trim()) {
+        return new Response(
+          JSON.stringify({ error: "Message body cannot be empty." }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      // Server-Side Auto-Append of opt-out suffix BEFORE segment analysis
+      const resolvedMessage = `${rawMessage}${OPT_OUT_SUFFIX}`;
       const segmentAnalysis = analyzeSmsSegments(resolvedMessage);
       const actualSegments = segmentAnalysis.segments;
       const calculatedCost = actualSegments;
 
       if (
-        !resolvedMessage ||
-        segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
         actualSegments < 1 ||
         actualSegments > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
           JSON.stringify({
-            error: `Message must be between 1 and ${MAX_ALLOWED_CHARACTERS} characters and fit within ${MAX_ALLOWED_SEGMENTS} segment.`,
+            error:
+              "400 Bad Request: Message exceeds 1 segment with opt-out suffix.",
           }),
           {
             status: 400,
@@ -810,9 +880,9 @@ serve(async (req: Request): Promise<Response> => {
       const trimmedName = String(name ?? "").trim();
       const trimmedSenderId =
         String(senderId ?? DEFAULT_SENDER_ID).trim() || DEFAULT_SENDER_ID;
-      const messageText = String(message ?? "");
+      const rawMessage = String(message ?? "");
 
-      if (!idempotencyKey || !trimmedName || !messageText) {
+      if (!idempotencyKey || !trimmedName || !rawMessage.trim()) {
         return new Response(
           JSON.stringify({ error: "Missing required campaign fields." }),
           {
@@ -846,19 +916,20 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // 1. Server-side segment & character analysis (Zero-Trust)
+      // 1. Server-Side Auto-Append & Segment Analysis (Zero-Trust)
+      const messageText = `${rawMessage}${OPT_OUT_SUFFIX}`;
       const segmentAnalysis = analyzeSmsSegments(messageText);
       const actualSegments = segmentAnalysis.segments;
 
       if (
-        segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
         actualSegments < 1 ||
         actualSegments > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
           JSON.stringify({
-            error: `Campaign message exceeds the ${MAX_ALLOWED_CHARACTERS}-character / ${MAX_ALLOWED_SEGMENTS}-segment ceiling.`,
+            error:
+              "400 Bad Request: Message exceeds 1 segment with opt-out suffix.",
           }),
           {
             status: 400,
@@ -1078,9 +1149,14 @@ serve(async (req: Request): Promise<Response> => {
       const trimmedName = String(name ?? "").trim();
       const trimmedSenderId =
         String(senderId ?? DEFAULT_SENDER_ID).trim() || DEFAULT_SENDER_ID;
-      const messageText = String(message ?? "");
+      const rawMessage = String(message ?? "");
 
-      if (!idempotencyKey || !trimmedName || !messageText || !scheduledAt) {
+      if (
+        !idempotencyKey ||
+        !trimmedName ||
+        !rawMessage.trim() ||
+        !scheduledAt
+      ) {
         return new Response(
           JSON.stringify({
             error: "Missing required scheduled campaign fields.",
@@ -1116,19 +1192,20 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // 1. Server-side segment & character analysis (Zero-Trust)
+      // 1. Server-Side Auto-Append & Segment Analysis (Zero-Trust)
+      const messageText = `${rawMessage}${OPT_OUT_SUFFIX}`;
       const segmentAnalysis = analyzeSmsSegments(messageText);
       const actualSegments = segmentAnalysis.segments;
 
       if (
-        segmentAnalysis.rawCharacterCount > MAX_ALLOWED_CHARACTERS ||
         actualSegments < 1 ||
         actualSegments > MAX_ALLOWED_SEGMENTS ||
         segmentAnalysis.isOverMaxSegments
       ) {
         return new Response(
           JSON.stringify({
-            error: `Campaign message exceeds the ${MAX_ALLOWED_CHARACTERS}-character / ${MAX_ALLOWED_SEGMENTS}-segment ceiling.`,
+            error:
+              "400 Bad Request: Message exceeds 1 segment with opt-out suffix.",
           }),
           {
             status: 400,
@@ -1489,6 +1566,30 @@ serve(async (req: Request): Promise<Response> => {
         );
 
       if (upsertErr) throw upsertErr;
+
+      const providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/optouts`, {
+        method: "POST",
+        headers: {
+          Authorization: `${Deno.env.get("SMS_API")}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          mobile_number: cleanPhone,
+          phone: cleanPhone,
+        }),
+      });
+
+      if (!providerRes.ok) {
+        return new Response(
+          JSON.stringify({
+            error: "Failed to sync opt-out number with Sendmode.",
+          }),
+          {
+            status: 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
 
       return new Response(
         JSON.stringify({ success: true, phone: cleanPhone }),

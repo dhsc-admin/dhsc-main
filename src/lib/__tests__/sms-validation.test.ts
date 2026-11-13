@@ -19,6 +19,8 @@ import {
   isValidE164,
   MAX_ALLOWED_CHARACTERS,
   MAX_ALLOWED_SEGMENTS,
+  MAX_UCS2_CHARACTERS,
+  OPT_OUT_SUFFIX,
   sanitizeRecipients,
   validateScheduleTimestamp,
 } from "../sms-validation";
@@ -52,8 +54,11 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     expect(res.invalidFormatRejected).toEqual(["98100-INVALID"]);
   });
 
-  it("2. Accurately calculates GSM-7 (including extended chars like €) vs UCS-2 and enforces 150-char / 1-segment limit", () => {
-    expect(MAX_ALLOWED_CHARACTERS).toBe(150);
+  it("2. Accurately calculates GSM-7 (including extended chars like €) vs UCS-2 and enforces 144 GSM-7 / 54 UCS-2 / 1-segment limit", () => {
+    expect(OPT_OUT_SUFFIX).toBe(" Stop: dhsc.uk/x");
+    expect(OPT_OUT_SUFFIX.length).toBe(16);
+    expect(MAX_ALLOWED_CHARACTERS).toBe(144);
+    expect(MAX_UCS2_CHARACTERS).toBe(54);
     expect(MAX_ALLOWED_SEGMENTS).toBe(1);
     expect(DEFAULT_SENDER_ID).toBe("Dilli Haat");
 
@@ -62,20 +67,34 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     // "Hello Dilli Haat €10 voucher" is 28 chars, but '€' is 2 septets -> 29 effective units
     expect(singleGsm.charCount).toBe(28);
     expect(singleGsm.effectiveUnits).toBe(29);
+    expect(singleGsm.perSegmentLimit).toBe(144);
+    expect(singleGsm.remainingInSegment).toBe(144 - 29);
     expect(singleGsm.segmentCount).toBe(1);
     expect(singleGsm.isOverLimit).toBe(false);
 
-    const exact150Gsm = calculateMessageDetails("A".repeat(150));
-    expect(exact150Gsm.charCount).toBe(150);
-    expect(exact150Gsm.segmentCount).toBe(1);
-    expect(exact150Gsm.isOverLimit).toBe(false);
+    const exact144Gsm = calculateMessageDetails("A".repeat(144));
+    expect(exact144Gsm.charCount).toBe(144);
+    expect(exact144Gsm.remainingInSegment).toBe(0);
+    expect(exact144Gsm.segmentCount).toBe(1);
+    expect(exact144Gsm.isOverLimit).toBe(false);
 
-    const over150Gsm = calculateMessageDetails("A".repeat(151));
-    expect(over150Gsm.charCount).toBe(151);
-    expect(over150Gsm.isOverLimit).toBe(true);
+    const over144Gsm = calculateMessageDetails("A".repeat(145));
+    expect(over144Gsm.charCount).toBe(145);
+    expect(over144Gsm.isOverLimit).toBe(true);
 
     const backtickUcs2 = calculateMessageDetails("Backtick ` forces UCS-2");
     expect(backtickUcs2.encoding).toBe("UCS-2 (Unicode)");
+    expect(backtickUcs2.perSegmentLimit).toBe(54);
+
+    const exact54Ucs2 = calculateMessageDetails("`" + "A".repeat(53));
+    expect(exact54Ucs2.charCount).toBe(54);
+    expect(exact54Ucs2.remainingInSegment).toBe(0);
+    expect(exact54Ucs2.segmentCount).toBe(1);
+    expect(exact54Ucs2.isOverLimit).toBe(false);
+
+    const over54Ucs2 = calculateMessageDetails("`" + "A".repeat(54));
+    expect(over54Ucs2.charCount).toBe(55);
+    expect(over54Ucs2.isOverLimit).toBe(true);
 
     const multiGsm = analyzeSmsSegments("A".repeat(161));
     expect(multiGsm.encoding).toBe("GSM-7");
