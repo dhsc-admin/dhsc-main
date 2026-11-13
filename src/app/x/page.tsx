@@ -17,7 +17,7 @@ export default function PublicOptOutPage() {
     const cleanPhone = phoneNumber.trim().replace(/[\s()-]/g, "");
     if (!isValidE164(cleanPhone)) {
       setErrorMessage(
-        "Please enter a valid phone number in international E.164 format (e.g., +447700900077)."
+        "Must be a valid UK number starting with +44 (e.g., +447700900077)."
       );
       return;
     }

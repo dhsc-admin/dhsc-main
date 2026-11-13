@@ -34,7 +34,7 @@ const ALLOWED_ORIGINS = [
   "https://www.dhsc.uk",
 ];
 
-const E164_REGEX = /^\+[1-9]\d{6,14}$/;
+const E164_REGEX = /^\+44\d{9,10}$/;
 const OPT_OUT_SUFFIX = " Stop: dhsc.uk/x";
 const MAX_ALLOWED_SEGMENTS = 1;
 const DEFAULT_SENDER_ID = "Dilli Haat";
@@ -482,7 +482,8 @@ serve(async (req: Request): Promise<Response> => {
       if (!E164_REGEX.test(cleanPhone)) {
         return new Response(
           JSON.stringify({
-            error: "400 Bad Request: Invalid E.164 phone number format.",
+            error:
+              "400 Bad Request: Only valid UK (+44) phone numbers are accepted (e.g., +447700900077).",
           }),
           {
             status: 400,
@@ -618,7 +619,10 @@ serve(async (req: Request): Promise<Response> => {
       const cleanPhone = String(phoneNumber ?? "").trim();
       if (!E164_REGEX.test(cleanPhone)) {
         return new Response(
-          JSON.stringify({ error: "Invalid E.164 phone number format." }),
+          JSON.stringify({
+            error:
+              "400 Bad Request: Only valid UK (+44) phone numbers are accepted (e.g., +447700900077).",
+          }),
           {
             status: 400,
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -1544,7 +1548,8 @@ serve(async (req: Request): Promise<Response> => {
       if (!E164_REGEX.test(cleanPhone)) {
         return new Response(
           JSON.stringify({
-            error: "Phone number must be strict E.164 format.",
+            error:
+              "400 Bad Request: Only valid UK (+44) phone numbers are accepted (e.g., +447700900077).",
           }),
           {
             status: 400,

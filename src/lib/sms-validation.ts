@@ -149,10 +149,10 @@ export function analyzeSmsSegments(text: string): SegmentAnalysis {
 }
 
 /**
- * Strict E.164 Phone Number Validation
- * Must start with '+', followed by country code (1-9) and 6 to 14 additional digits (total 7-15 digits).
+ * Strict UK E.164 Phone Number Validation
+ * Must start with '+44' followed by 9 or 10 digits.
  */
-export const E164_REGEX = /^\+[1-9]\d{6,14}$/;
+export const E164_REGEX = /^\+44\d{9,10}$/;
 
 export function isValidE164(phone: string): boolean {
   return E164_REGEX.test(phone.trim());
@@ -351,7 +351,10 @@ export const TestSmsSchema = z.object({
   recipientPhone: z
     .string()
     .trim()
-    .regex(E164_REGEX, "Must be strict E.164 format (e.g., +14155552671)"),
+    .regex(
+      E164_REGEX,
+      "Must be a valid UK number starting with +44 (e.g., +447700900077)"
+    ),
   message: z
     .string()
     .min(1, "Message body cannot be empty")
@@ -387,7 +390,20 @@ export const CampaignFormSchema = z
       .max(15, "Sender ID must be <= 15 characters")
       .default(DEFAULT_SENDER_ID),
     audienceId: z.string().min(1, "Please select a recipient audience or custom list"),
-    customRecipientsRaw: z.string().optional(),
+    customRecipientsRaw: z
+      .string()
+      .optional()
+      .refine(
+        (val) => {
+          if (!val || !val.trim()) return true;
+          const phones = parsePhoneListString(val);
+          return phones.every((p) => E164_REGEX.test(p.replace(/[\s()-]/g, "")));
+        },
+        {
+          message:
+            "Must be a valid UK number starting with +44 (e.g., +447700900077)",
+        }
+      ),
     message: z
       .string()
       .min(1, "SMS message body is required")

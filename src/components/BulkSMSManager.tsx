@@ -421,7 +421,9 @@ export const ApiServices = {
   // 6. Optout Number (Syncs number to sms-rest 3.0 blacklist + Supabase opt_outs)
   optoutNumber: async (phoneNumber: string): Promise<{ success: boolean }> => {
     if (!isValidE164(phoneNumber)) {
-      throw new Error("Phone number must be strict E.164 format.");
+      throw new Error(
+        "Phone number must be a valid UK number starting with +44 (e.g., +447700900077)."
+      );
     }
     const { data, error } = await supabase.functions.invoke("sms-proxy", {
       body: {
@@ -491,7 +493,7 @@ export default function BulkSMSManager({
 
   // Test SMS Modal State
   const [testModalOpen, setTestModalOpen] = useState(false);
-  const [testPhone, setTestPhone] = useState("+44");
+  const [testPhone, setTestPhone] = useState("+447700900077");
   const [testScheduled, setTestScheduled] = useState(false);
   const [testScheduleDate, setTestScheduleDate] = useState("");
   const [testIdempotencyKey, setTestIdempotencyKey] = useState("");
@@ -979,7 +981,7 @@ export default function BulkSMSManager({
     const cleanPhone = testPhone.trim().replace(/[\s()-]/g, "");
     if (!isValidE164(cleanPhone)) {
       showToast(
-        "Invalid E.164 phone number format. Must start with + and country code (e.g. +44 7...).",
+        "Must be a valid UK number starting with +44 (e.g., +447700900077).",
         "error"
       );
       return;
@@ -1055,7 +1057,10 @@ export default function BulkSMSManager({
     e.preventDefault();
     const clean = newOptOutPhone.trim().replace(/[\s()-]/g, "");
     if (!isValidE164(clean)) {
-      showToast("Enter a valid E.164 number (e.g. +447xxxxxxxxx)", "error");
+      showToast(
+        "Must be a valid UK number starting with +44 (e.g., +447700900077)",
+        "error"
+      );
       return;
     }
     if (optOuts.includes(clean)) {
@@ -2041,18 +2046,18 @@ export default function BulkSMSManager({
               </p>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
-                  Test Phone Number (Strict E.164)
+                  Test Phone Number (UK +44)
                 </label>
                 <input
                   type="tel"
                   value={testPhone}
                   onChange={(e) => setTestPhone(e.target.value)}
                   className="w-full px-3 py-3 sm:py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-base sm:text-sm font-mono"
-                  placeholder="+447777777777"
+                  placeholder="+447700900077"
                 />
                 {!E164_REGEX.test(testPhone.trim()) && testPhone.trim().length > 0 && (
                   <p className="text-xs text-red-600 mt-1">
-                    Must start with + followed by country code and digits (e.g. +447777777777).
+                    Must be a valid UK number starting with +44 (e.g., +447700900077).
                   </p>
                 )}
               </div>
@@ -2141,7 +2146,7 @@ export default function BulkSMSManager({
                   type="tel"
                   value={newOptOutPhone}
                   onChange={(e) => setNewOptOutPhone(e.target.value)}
-                  placeholder="+447777777777"
+                  placeholder="+447700900077"
                   className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 outline-none"
                 />
                 <button

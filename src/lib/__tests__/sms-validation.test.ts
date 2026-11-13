@@ -32,26 +32,34 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     vi.restoreAllMocks();
   });
 
-  it("1. Enforces strict E.164 validation, deduplication, and opt-out stripping", () => {
-    expect(isValidE164("+447777777777")).toBe(true);
-    expect(isValidE164("+14155552671")).toBe(true);
+  it("1. Enforces strict UK (+44) E.164 validation, deduplication, and opt-out stripping", () => {
+    expect(isValidE164("+447700900077")).toBe(true);
+    expect(isValidE164("+442079460991")).toBe(true);
+    expect(isValidE164("+14155552671")).toBe(false);
+    expect(isValidE164("+919810012345")).toBe(false);
     expect(isValidE164("98100-12345")).toBe(false);
     expect(isValidE164("+0123456789")).toBe(false);
 
     const raw = [
-      "+919810012345",
-      "+919810012345", // duplicate
-      "+919810000101", // opted-out
-      "98100-INVALID", // invalid E.164
-      "+919810054321",
+      "+447700900077",
+      "+447700900077", // duplicate
+      "+447700900099", // opted-out
+      "+919810012345", // non-UK rejected
+      "+14155552671", // non-UK rejected
+      "07700-INVALID", // invalid E.164
+      "+447700900078",
     ];
-    const optOuts = ["+919810000101"];
+    const optOuts = ["+447700900099"];
 
     const res = sanitizeRecipients(raw, optOuts);
-    expect(res.validBillableNumbers).toEqual(["+919810012345", "+919810054321"]);
-    expect(res.duplicatesRemoved).toEqual(["+919810012345"]);
-    expect(res.optedOutStripped).toEqual(["+919810000101"]);
-    expect(res.invalidFormatRejected).toEqual(["98100-INVALID"]);
+    expect(res.validBillableNumbers).toEqual(["+447700900077", "+447700900078"]);
+    expect(res.duplicatesRemoved).toEqual(["+447700900077"]);
+    expect(res.optedOutStripped).toEqual(["+447700900099"]);
+    expect(res.invalidFormatRejected).toEqual([
+      "+919810012345",
+      "+14155552671",
+      "07700-INVALID",
+    ]);
   });
 
   it("2. Accurately calculates GSM-7 (including extended chars like €) vs UCS-2 and enforces 144 GSM-7 / 54 UCS-2 / 1-segment limit", () => {

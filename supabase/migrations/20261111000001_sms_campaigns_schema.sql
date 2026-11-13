@@ -9,7 +9,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 -- 0. Customer Contacts Table (`contacts` — normalized minimal schema without unnecessary PII)
 CREATE TABLE IF NOT EXISTS public.contacts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    phone_e164 TEXT NOT NULL UNIQUE CHECK (phone_e164 ~ '^\+[1-9][0-9]{6,14}$'),
+    phone_e164 TEXT NOT NULL UNIQUE CHECK (phone_e164 ~ '^\+44[0-9]{9,10}$'),
     customer_name TEXT,
     visit_count INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -20,10 +20,10 @@ CREATE TABLE IF NOT EXISTS public.opt_outs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     phone TEXT NOT NULL UNIQUE,
     reason TEXT NOT NULL DEFAULT 'User opted out',
-    source TEXT NOT NULL DEFAULT 'webhook_stop' CHECK (source IN ('webhook_stop', 'manual_admin', 'provider_sync')),
+    source TEXT NOT NULL DEFAULT 'webhook_stop' CHECK (source IN ('webhook_stop', 'manual_admin', 'provider_sync', 'public_link')),
     provider_synced BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT opt_outs_phone_e164_chk CHECK (phone ~ '^\+[1-9][0-9]{6,14}$')
+    CONSTRAINT opt_outs_phone_e164_chk CHECK (phone ~ '^\+44[0-9]{9,10}$')
 );
 
 -- 2. Campaigns Audit & Queue Table (`sms_campaigns`)
