@@ -17,15 +17,24 @@ import {
   DEFAULT_SENDER_ID,
   evaluateCreditGate,
   isValidE164,
+  londonLocalToUtcDate,
+  londonLocalToUtcIso,
   MAX_ALLOWED_CHARACTERS,
   MAX_ALLOWED_SEGMENTS,
   MAX_UCS2_CHARACTERS,
   OPT_OUT_SUFFIX,
   sanitizeRecipients,
+  utcToLondonDate,
+  utcToLondonLocalString,
   validateScheduleTimestamp,
 } from "../sms-validation";
 import { supabase } from "../supabase";
-import { calculateMessageDetails, ApiServices } from "../../components/BulkSMSManager";
+import {
+  calculateMessageDetails,
+  ApiServices,
+  formatDate,
+  getFutureDatetimeLocal,
+} from "../../components/BulkSMSManager";
 
 describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () => {
   afterEach(() => {
@@ -140,7 +149,7 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     expect(rejected.canAffordCampaign).toBe(false);
   });
 
-  it("4. Enforces 15-minute future scheduling buffer and 5-minute cancellation lock", () => {
+  it("4. Enforces 15-minute future scheduling buffer, 5-minute cancellation lock, and Europe/London <-> UTC conversion", () => {
     const now = Date.now();
     const tenMinAhead = new Date(now + 10 * 60 * 1000).toISOString();
     const twentyMinAhead = new Date(now + 20 * 60 * 1000).toISOString();
@@ -151,6 +160,31 @@ describe("Dilli Haat SMS Campaign (DHSC) — Guardrail & Validation Suite", () =
     const threeMinAhead = new Date(now + 3 * 60 * 1000).toISOString();
     expect(canCancelScheduledCampaign(threeMinAhead, now).allowed).toBe(false);
     expect(canCancelScheduledCampaign(twentyMinAhead, now).allowed).toBe(true);
+
+    // British Summer Time (BST = UTC+1): 14:30 in London -> 13:30 UTC
+    const bstUtcIso = londonLocalToUtcIso("2026-07-15T14:30");
+    expect(bstUtcIso).toBe("2026-07-15T13:30:00Z");
+    expect(utcToLondonLocalString("2026-07-15T13:30:00Z")).toBe(
+      "2026-07-15T14:30"
+    );
+    expect(londonLocalToUtcDate("2026-07-15T14:30")?.toISOString()).toBe(
+      "2026-07-15T13:30:00.000Z"
+    );
+    expect(utcToLondonDate("2026-07-15T13:30:00Z")).toBeInstanceOf(Date);
+
+    // Greenwich Mean Time (GMT = UTC+0): 14:30 in London -> 14:30 UTC
+    const gmtUtcIso = londonLocalToUtcIso("2026-11-15T14:30");
+    expect(gmtUtcIso).toBe("2026-11-15T14:30:00Z");
+    expect(utcToLondonLocalString("2026-11-15T14:30:00Z")).toBe(
+      "2026-11-15T14:30"
+    );
+
+    // Default scheduler input helper generates Europe/London local string
+    const bstBaseMs = Date.parse("2026-07-15T13:00:00Z"); // 14:00 BST
+    expect(getFutureDatetimeLocal(30, bstBaseMs)).toBe("2026-07-15T14:30");
+
+    // UI formatDate forces Europe/London display
+    expect(formatDate("2026-07-15T13:30:00Z", true)).toContain("14:30");
   });
 
   it("5. Wires ApiServices to supabase.functions.invoke('sms-proxy') and propagates guardrail errors", async () => {

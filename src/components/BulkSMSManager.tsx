@@ -9,7 +9,10 @@ import {
   DEFAULT_SENDER_ID,
   E164_REGEX,
   evaluateCreditGate,
+  getFutureLondonDatetimeLocal,
   isValidE164,
+  LONDON_TIMEZONE,
+  londonLocalToUtcIso,
   MAX_ALLOWED_SEGMENTS,
   MAX_GSM7_CHARACTERS,
   MAX_UCS2_CHARACTERS,
@@ -132,36 +135,32 @@ export const calculateMessageDetails = (text: string) => {
 };
 
 const toSafeIsoString = (dateStr: string): string | null => {
-  if (!dateStr) return null;
-  const date = new Date(dateStr);
-  if (Number.isNaN(date.getTime())) return null;
-  return date.toISOString();
+  return londonLocalToUtcIso(dateStr);
 };
 
-const formatDate = (isoString: string | null, isMounted: boolean): string => {
+export const formatDate = (
+  isoString: string | null,
+  _isMounted = true
+): string => {
   if (!isoString) return "Immediate";
   const date = new Date(isoString);
   if (Number.isNaN(date.getTime())) return "Invalid Date";
-  if (!isMounted) {
-    // Deterministic UTC string during SSR to avoid hydration mismatch
-    return `${isoString.slice(0, 16).replace("T", " ")} UTC`;
-  }
-  return date.toLocaleString("en-US", {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: LONDON_TIMEZONE,
     month: "short",
     day: "numeric",
     year: "numeric",
     hour: "numeric",
     minute: "2-digit",
     timeZoneName: "short",
-  });
+  }).format(date);
 };
 
-const getFutureDatetimeLocal = (minutesAhead = 30): string => {
-  const d = new Date(Date.now() + minutesAhead * 60 * 1000);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
-    d.getHours()
-  )}:${pad(d.getMinutes())}`;
+export const getFutureDatetimeLocal = (
+  minutesAhead = 30,
+  nowMs: number = Date.now()
+): string => {
+  return getFutureLondonDatetimeLocal(minutesAhead, nowMs);
 };
 
 const generateUUID = (): string => {
@@ -1637,6 +1636,9 @@ export default function BulkSMSManager({
                       value={scheduleDate}
                       onChange={(e) => setScheduleDate(e.target.value)}
                     />
+                    <p className="text-xs text-slate-500">
+                      Timezone: London (GMT/BST)
+                    </p>
                     {safeScheduleIso && (
                       <p className="text-xs text-slate-500 font-mono">
                         UTC Stored: {safeScheduleIso}
@@ -2089,12 +2091,17 @@ export default function BulkSMSManager({
               </div>
 
               {testScheduled && (
-                <input
-                  type="datetime-local"
-                  value={testScheduleDate}
-                  onChange={(e) => setTestScheduleDate(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
-                />
+                <div className="space-y-1.5">
+                  <input
+                    type="datetime-local"
+                    value={testScheduleDate}
+                    onChange={(e) => setTestScheduleDate(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                  />
+                  <p className="text-xs text-slate-500">
+                    Timezone: London (GMT/BST)
+                  </p>
+                </div>
               )}
             </div>
             <div className="px-4 sm:px-6 py-4 bg-slate-50 border-t border-slate-100 flex flex-col-reverse sm:flex-row justify-end gap-3">

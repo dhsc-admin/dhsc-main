@@ -166,6 +166,24 @@ function chunkPhoneNumbers(
 }
 
 /**
+ * Parses an incoming `scheduledAt` timestamp strictly as UTC and returns
+ * the epoch milliseconds alongside the normalized `YYYY-MM-DDThh:mm:ssZ`
+ * UTC ISO 8601 string required by Sendmode (`schedule_date`).
+ */
+function parseUtcScheduleIso(
+  rawScheduledAt: unknown
+): { parsedMs: number; isoUtc: string } | null {
+  const str = String(rawScheduledAt ?? "").trim();
+  if (!str) return null;
+  const hasExplicitZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(str);
+  const utcCandidate = hasExplicitZone ? str : `${str}Z`;
+  const parsedMs = Date.parse(utcCandidate);
+  if (Number.isNaN(parsedMs)) return null;
+  const isoUtc = new Date(parsedMs).toISOString().replace(/\.\d{3}Z$/, "Z");
+  return { parsedMs, isoUtc };
+}
+
+/**
  * Strict CORS Enforcement: Dynamically accept requests from `ALLOWED_ORIGINS`.
  */
 function getCorsConfig(req: Request): {
@@ -713,10 +731,13 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
+      let singleScheduleIsoUtc: string | null = null;
       if (scheduledAt) {
-        const diffMinutes =
-          (Date.parse(String(scheduledAt)) - Date.now()) / (1000 * 60);
-        if (Number.isNaN(diffMinutes) || diffMinutes < 15) {
+        const parsedUtc = parseUtcScheduleIso(scheduledAt);
+        const diffMinutes = parsedUtc
+          ? (parsedUtc.parsedMs - Date.now()) / (1000 * 60)
+          : NaN;
+        if (!parsedUtc || Number.isNaN(diffMinutes) || diffMinutes < 15) {
           return new Response(
             JSON.stringify({
               error:
@@ -728,6 +749,7 @@ serve(async (req: Request): Promise<Response> => {
             }
           );
         }
+        singleScheduleIsoUtc = parsedUtc.isoUtc;
       }
 
       // Credit Gate via GET /3.0/balance
@@ -764,11 +786,9 @@ serve(async (req: Request): Promise<Response> => {
           duplicates_removed_count: 0,
           opted_out_stripped_count: 0,
           invalid_rejected_count: 0,
-          dispatch_type: scheduledAt ? "scheduled" : "immediate",
+          dispatch_type: singleScheduleIsoUtc ? "scheduled" : "immediate",
           status: "processing",
-          scheduled_at: scheduledAt
-            ? new Date(String(scheduledAt)).toISOString()
-            : null,
+          scheduled_at: singleScheduleIsoUtc,
         })
         .select()
         .single();
@@ -1218,9 +1238,11 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      const parsedScheduleMs = Date.parse(String(scheduledAt));
-      const diffMinutes = (parsedScheduleMs - Date.now()) / (1000 * 60);
-      if (Number.isNaN(parsedScheduleMs) || diffMinutes < 15) {
+      const parsedUtcSchedule = parseUtcScheduleIso(scheduledAt);
+      const diffMinutes = parsedUtcSchedule
+        ? (parsedUtcSchedule.parsedMs - Date.now()) / (1000 * 60)
+        : NaN;
+      if (!parsedUtcSchedule || Number.isNaN(diffMinutes) || diffMinutes < 15) {
         return new Response(
           JSON.stringify({
             error:
@@ -1233,8 +1255,8 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      // Format `schedule_date` as an ISO 8601 string in UTC
-      const scheduleDateIsoUtc = new Date(parsedScheduleMs).toISOString();
+      // Format `schedule_date` strictly as an ISO 8601 string in UTC (`YYYY-MM-DDThh:mm:ssZ`)
+      const scheduleDateIsoUtc = parsedUtcSchedule.isoUtc;
 
       // 2. Fetch Recipients Server-Side (Zero-Trust; ignores frontend `recipientsCount`)
       const resolvedAudience = await resolveAudienceRecipients(

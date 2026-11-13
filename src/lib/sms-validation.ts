@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { addMinutes } from "date-fns";
+import { formatInTimeZone, fromZonedTime, toZonedTime } from "date-fns-tz";
 
 /**
  * NON-NEGOTIABLE GUARDRAIL CONSTANTS
@@ -15,6 +17,7 @@ export const MAX_ALLOWED_SEGMENTS = 1;
 export const DEFAULT_SENDER_ID = "Dilli Haat";
 export const MIN_SCHEDULE_BUFFER_MINUTES = 15;
 export const MIN_CANCEL_BUFFER_MINUTES = 5;
+export const LONDON_TIMEZONE = "Europe/London";
 
 /**
  * Standard 3GPP TS 23.038 GSM-7 Default Alphabet (1 septet each)
@@ -229,6 +232,55 @@ export function parsePhoneListString(input: string): string[] {
     .split(/[\n,;]+/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/**
+ * Explicit London (`Europe/London`) <-> UTC Timezone Conversion Helpers
+ * Automatically accounts for GMT (UTC+0) and BST (UTC+1).
+ */
+export function londonLocalToUtcDate(londonDateTimeStr: string): Date | null {
+  const trimmed = londonDateTimeStr?.trim();
+  if (!trimmed) return null;
+  if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(trimmed)) {
+    return null;
+  }
+  const utcDate = fromZonedTime(trimmed, LONDON_TIMEZONE);
+  if (Number.isNaN(utcDate.getTime())) {
+    return null;
+  }
+  return utcDate;
+}
+
+export function londonLocalToUtcIso(londonDateTimeStr: string): string | null {
+  const utcDate = londonLocalToUtcDate(londonDateTimeStr);
+  if (!utcDate) return null;
+  return utcDate.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+export function utcToLondonDate(utcInput: Date | string | number): Date | null {
+  const baseDate = utcInput instanceof Date ? utcInput : new Date(utcInput);
+  if (Number.isNaN(baseDate.getTime())) {
+    return null;
+  }
+  return toZonedTime(baseDate, LONDON_TIMEZONE);
+}
+
+export function utcToLondonLocalString(
+  utcInput: Date | string | number
+): string | null {
+  const baseDate = utcInput instanceof Date ? utcInput : new Date(utcInput);
+  if (Number.isNaN(baseDate.getTime())) {
+    return null;
+  }
+  return formatInTimeZone(baseDate, LONDON_TIMEZONE, "yyyy-MM-dd'T'HH:mm");
+}
+
+export function getFutureLondonDatetimeLocal(
+  minutesAhead = 30,
+  nowMs: number = Date.now()
+): string {
+  const targetUtcDate = addMinutes(new Date(nowMs), minutesAhead);
+  return formatInTimeZone(targetUtcDate, LONDON_TIMEZONE, "yyyy-MM-dd'T'HH:mm");
 }
 
 /**
