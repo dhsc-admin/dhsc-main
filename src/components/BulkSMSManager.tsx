@@ -222,13 +222,12 @@ export const ApiServices = {
     };
   },
 
-  // 2. Send Single SMS / Schedule Single SMS (sms-rest 3.0)
+  // 2. Send Single SMS (Immediate only, sms-rest 3.0)
   sendSingleSMS: async (payload: {
     idempotencyKey: string;
     phoneNumber: string;
     messageBody: string;
     segments: number;
-    scheduledAt: string | null;
     senderId?: string;
   }): Promise<{ success: boolean; messageId: string; newBalance?: number }> => {
     const { data, error } = await supabase.functions.invoke("sms-proxy", {
@@ -239,7 +238,6 @@ export const ApiServices = {
         phoneNumber: payload.phoneNumber,
         messageBody: payload.messageBody,
         segments: payload.segments,
-        scheduledAt: payload.scheduledAt,
       },
     });
     if (error) {
@@ -250,9 +248,7 @@ export const ApiServices = {
     }
     return {
       success: true,
-      messageId:
-        data?.messageId ??
-        `${payload.scheduledAt ? "sched-msg" : "msg"}-${Date.now()}`,
+      messageId: data?.messageId ?? `msg-${Date.now()}`,
       newBalance:
         typeof data?.newBalance === "number"
           ? data.newBalance
@@ -518,8 +514,6 @@ export default function BulkSMSManager({
   // Test SMS Modal State
   const [testModalOpen, setTestModalOpen] = useState(false);
   const [testPhone, setTestPhone] = useState("+447700900077");
-  const [testScheduled, setTestScheduled] = useState(false);
-  const [testScheduleDate, setTestScheduleDate] = useState("");
   const [testIdempotencyKey, setTestIdempotencyKey] = useState("");
   const [isSendingTest, setIsSendingTest] = useState(false);
 
@@ -809,8 +803,6 @@ export default function BulkSMSManager({
 
   const handleOpenTestModal = () => {
     setTestIdempotencyKey(generateUUID());
-    setTestScheduled(false);
-    setTestScheduleDate(getFutureDatetimeLocal(30));
     setTestModalOpen(true);
   };
 
@@ -1045,25 +1037,6 @@ export default function BulkSMSManager({
       return;
     }
 
-    let scheduledIso: string | null = null;
-    if (testScheduled) {
-      const parsedIso = toSafeIsoString(testScheduleDate);
-      if (!parsedIso) {
-        showToast("Please select a valid schedule time for the test SMS.", "error");
-        return;
-      }
-      scheduledIso = parsedIso;
-      const check = validateScheduleTimestamp(scheduledIso, Date.now());
-      if (!check.valid) {
-        showToast(
-          check.error ||
-          `Scheduled single SMS must be at least ${MIN_SCHEDULE_BUFFER_MINUTES} minutes in the future.`,
-          "error"
-        );
-        return;
-      }
-    }
-
     setIsSendingTest(true);
     try {
       const res = await ApiServices.sendSingleSMS({
@@ -1071,16 +1044,16 @@ export default function BulkSMSManager({
         phoneNumber: cleanPhone,
         messageBody: message,
         segments: msgDetails.segmentCount,
-        scheduledAt: scheduledIso,
       });
       if (typeof res.newBalance === "number") {
         setLiveBalance(res.newBalance);
-      } else if (!testScheduled) {
+      } else {
         setLiveBalance((prev) => Math.max(0, prev - msgDetails.segmentCount));
       }
       showToast(
-        `${testScheduled ? "Scheduled test SMS" : "Test SMS sent"} to ${cleanPhone} (${msgDetails.segmentCount
-        } credit${msgDetails.segmentCount > 1 ? "s" : ""})`
+        `Test SMS sent to ${cleanPhone} (${msgDetails.segmentCount} credit${
+          msgDetails.segmentCount > 1 ? "s" : ""
+        })`
       );
       setTestModalOpen(false);
     } catch (err) {
@@ -1545,19 +1518,24 @@ export default function BulkSMSManager({
                     } else if (nextVal.length < message.length) {
                       setMessage(nextVal);
                     } else {
-                      // Truncate to the exact allowed user limit for the detected encoding
-                      const hasOwnSuffix = nextVal
-                        .trimEnd()
-                        .toLowerCase()
-                        .endsWith("stop: dhsc.uk/x");
-                      const limit = hasOwnSuffix
-                        ? nextDetails.perSegmentLimit
-                        : Math.max(
-                            0,
-                            nextDetails.perSegmentLimit - OPT_OUT_SUFFIX_LENGTH
-                          );
-                      const truncated = Array.from(nextVal).slice(0, limit).join("");
-                      setMessage(truncated);
+                      // Truncate code points until effective units fit within 1 segment
+                      const codePoints = Array.from(nextVal);
+                      let end = Math.min(codePoints.length, nextDetails.perSegmentLimit);
+                      while (end > 0) {
+                        const candidate = codePoints.slice(0, end).join("");
+                        const candidateDetails = calculateMessageDetails(candidate);
+                        if (
+                          candidateDetails.effectiveUnits <=
+                            candidateDetails.perSegmentLimit &&
+                          candidateDetails.charCount <=
+                            candidateDetails.perSegmentLimit
+                        ) {
+                          setMessage(candidate);
+                          return;
+                        }
+                        end--;
+                      }
+                      setMessage("");
                     }
                   }}
                 />
@@ -2117,46 +2095,6 @@ export default function BulkSMSManager({
                     </p>
                   )}
               </div>
-
-              <div className="flex items-center gap-4 text-sm">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    checked={!testScheduled}
-                    onChange={() => setTestScheduled(false)}
-                    className="text-blue-600"
-                  />
-                  <span>Send Single Now</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    checked={testScheduled}
-                    onChange={() => {
-                      setTestScheduled(true);
-                      if (!testScheduleDate) {
-                        setTestScheduleDate(getFutureDatetimeLocal(30));
-                      }
-                    }}
-                    className="text-blue-600"
-                  />
-                  <span>Schedule Single SMS</span>
-                </label>
-              </div>
-
-              {testScheduled && (
-                <div className="space-y-1.5">
-                  <input
-                    type="datetime-local"
-                    value={testScheduleDate}
-                    onChange={(e) => setTestScheduleDate(e.target.value)}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
-                  />
-                  <p className="text-xs text-slate-500">
-                    Timezone: London (GMT/BST)
-                  </p>
-                </div>
-              )}
             </div>
             <div className="px-4 sm:px-6 py-4 bg-slate-50 border-t border-slate-100 flex flex-col-reverse sm:flex-row justify-end gap-3">
               <button

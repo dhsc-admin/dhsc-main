@@ -705,7 +705,6 @@ serve(async (req: Request): Promise<Response> => {
         phoneNumber,
         messageBody,
         message,
-        scheduledAt,
         senderId = DEFAULT_SENDER_ID,
       } = body;
 
@@ -846,39 +845,6 @@ serve(async (req: Request): Promise<Response> => {
         );
       }
 
-      let singleScheduleIsoUtc: string | null = null;
-      if (scheduledAt) {
-        const parsedUtc = parseUtcScheduleIso(scheduledAt);
-        const diffMinutes = parsedUtc
-          ? (parsedUtc.parsedMs - Date.now()) / (1000 * 60)
-          : NaN;
-        if (!parsedUtc || Number.isNaN(diffMinutes) || diffMinutes < 15) {
-          return new Response(
-            JSON.stringify({
-              error:
-                "SCHEDULE_BUFFER_VIOLATION: Scheduled SMS must be at least 15 minutes in the future (UTC).",
-            }),
-            {
-              status: 400,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-        if (new Date(parsedUtc.parsedMs).getUTCMinutes() % 15 !== 0) {
-          return new Response(
-            JSON.stringify({
-              error:
-                "Scheduled time must be on a 15-minute interval (:00, :15, :30, or :45).",
-            }),
-            {
-              status: 400,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-        singleScheduleIsoUtc = parsedUtc.isoUtc;
-      }
-
       // Credit Gate via GET /3.0/balance
       const ledger = await computeCreditLedger(supabaseAdmin);
       if (ledger.liveBalance - ledger.reservedCredits < calculatedCost) {
@@ -913,9 +879,9 @@ serve(async (req: Request): Promise<Response> => {
           duplicates_removed_count: 0,
           opted_out_stripped_count: 0,
           invalid_rejected_count: 0,
-          dispatch_type: singleScheduleIsoUtc ? "scheduled" : "immediate",
+          dispatch_type: "immediate",
           status: "processing",
-          scheduled_at: singleScheduleIsoUtc,
+          scheduled_at: null,
         })
         .select()
         .single();
@@ -935,35 +901,21 @@ serve(async (req: Request): Promise<Response> => {
         throw insertErr;
       }
 
-      // Immediate: `POST /3.0/send`. Scheduled: `POST /3.0/schedule/bulk` (single recipient).
+      // Always dispatch single test SMS immediately via `POST /3.0/send`.
       let providerRes: Response;
       try {
-        providerRes = singleScheduleIsoUtc
-          ? await fetch(`${SENDMODE_BASE_URL}/3.0/schedule/bulk`, {
-              method: "POST",
-              headers: {
-                Authorization: `${Deno.env.get("SMS_API")}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                sender_id: trimmedSenderId,
-                message: resolvedMessage,
-                mobile_numbers: [cleanPhone],
-                schedule_date: singleScheduleIsoUtc,
-              }),
-            })
-          : await fetch(`${SENDMODE_BASE_URL}/3.0/send`, {
-              method: "POST",
-              headers: {
-                Authorization: `${Deno.env.get("SMS_API")}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                sender_id: trimmedSenderId,
-                message: resolvedMessage,
-                mobile_number: cleanPhone,
-              }),
-            });
+        providerRes = await fetch(`${SENDMODE_BASE_URL}/3.0/send`, {
+          method: "POST",
+          headers: {
+            Authorization: `${Deno.env.get("SMS_API")}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            sender_id: trimmedSenderId,
+            message: resolvedMessage,
+            mobile_number: cleanPhone,
+          }),
+        });
       } catch (networkErr) {
         console.error(networkErr);
         await supabaseAdmin
@@ -1005,16 +957,14 @@ serve(async (req: Request): Promise<Response> => {
       }
 
       const requestId = String(providerData?.request_id ?? "");
-      const newBalance = singleScheduleIsoUtc
-        ? ledger.liveBalance
-        : Math.max(0, ledger.liveBalance - calculatedCost);
+      const newBalance = Math.max(0, ledger.liveBalance - calculatedCost);
 
       const { error: updateErr } = await supabaseAdmin
         .from("sms_campaigns")
         .update({
-          status: singleScheduleIsoUtc ? "scheduled" : "sent",
+          status: "sent",
           provider_campaign_id: requestId,
-          dispatched_at: singleScheduleIsoUtc ? null : new Date().toISOString(),
+          dispatched_at: new Date().toISOString(),
         })
         .eq("id", processingRow.id);
 
@@ -1732,10 +1682,22 @@ serve(async (req: Request): Promise<Response> => {
         });
       }
 
+      if (campaign.status !== "scheduled") {
+        return new Response(
+          JSON.stringify({
+            error: `Cannot cancel campaign with status '${campaign.status}'. Only 'scheduled' campaigns can be cancelled.`,
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
       const diffMinutes =
         (Date.parse(String(campaign.scheduled_at)) - Date.now()) /
         (1000 * 60);
-      if (diffMinutes < 5) {
+      if (!Number.isFinite(diffMinutes) || diffMinutes < 5) {
         return new Response(
           JSON.stringify({
             error:

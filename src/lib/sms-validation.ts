@@ -490,8 +490,6 @@ export const TestSmsSchema = z.object({
         });
       }
     }),
-  scheduleMode: z.enum(["immediate", "scheduled"]).default("immediate"),
-  scheduledAtUtc: z.string().optional(),
   idempotencyKey: z.string().uuid("Valid UUID v4 idempotency_key is required"),
 });
 
